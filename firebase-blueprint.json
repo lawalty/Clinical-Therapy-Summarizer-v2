@@ -1,0 +1,74 @@
+{
+  "entities": {
+    "TherapistSettings": {
+      "title": "TherapistSettings",
+      "description": "Custom templates, branding, and directives for clinical session summaries",
+      "type": "object",
+      "properties": {
+        "styleInstructions": {
+          "type": "string",
+          "description": "System clinical instruction overrides"
+        },
+        "activeTemplateName": {
+          "type": "string",
+          "description": "Selected clinical layout template name"
+        },
+        "customTemplates": {
+          "type": "array",
+          "description": "Array of custom clinical profile/modality templates"
+        },
+        "therapistName": {
+          "type": "string",
+          "description": "Professional display name"
+        },
+        "therapistTitle": {
+          "type": "string",
+          "description": "Professional credential or title"
+        }
+      },
+      "required": ["styleInstructions", "activeTemplateName"]
+    },
+    "ClinicalArchive": {
+      "title": "ClinicalArchive",
+      "description": "An encrypted, secure session note archive",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique cryptographic or randomized archive identifier"
+        },
+        "name": {
+          "type": "string",
+          "description": "A customized clinical label for the patient note"
+        },
+        "date": {
+          "type": "string",
+          "description": "Locale-formatted date of note generation"
+        },
+        "framework": {
+          "type": "string",
+          "description": "Structure template (e.g., SOAP, DAP, BIRP, GIRP)"
+        },
+        "encryptedContent": {
+          "type": "string",
+          "description": "Symmetrically encrypted session summary content"
+        },
+        "encryptedNotes": {
+          "type": "string",
+          "description": "Symmetrically encrypted input verbatim transcript notes"
+        }
+      },
+      "required": ["id", "name", "date", "framework", "encryptedContent", "encryptedNotes"]
+    }
+  },
+  "firestore": {
+    "/therapists/{userId}/settings/directives": {
+      "schema": "TherapistSettings",
+      "description": "Individual therapist custom preferences, clinical instruction overrides, and profiles"
+    },
+    "/therapists/{userId}/archives/{archiveId}": {
+      "schema": "ClinicalArchive",
+      "description": "Secure, passcode-encrypted historical patient session note records"
+    }
+  }
+}
