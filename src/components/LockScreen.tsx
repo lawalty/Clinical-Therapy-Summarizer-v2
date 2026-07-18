@@ -18,14 +18,15 @@ import { motion } from "motion/react";
 interface LockScreenProps {
   onUnlock: (user: TherapistUser, passcode: string) => void;
   currentUser: TherapistUser | null;
+  initialError?: string;
 }
 
-export default function LockScreen({ onUnlock, currentUser }: LockScreenProps) {
+export default function LockScreen({ onUnlock, currentUser, initialError }: LockScreenProps) {
   const [passcode, setPasscode] = useState("");
   const [confirmPasscode, setConfirmPasscode] = useState("");
   const [isNewUser, setIsNewUser] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState(initialError || "");
   const [success, setSuccess] = useState("");
 
   const handleAuthAndUnlock = async (e: React.FormEvent) => {
@@ -76,10 +77,13 @@ export default function LockScreen({ onUnlock, currentUser }: LockScreenProps) {
           throw new Error("Incorrect Master Passcode. Please ensure your key is entered correctly.");
         }
       } else {
-        // Returning user selected "isNewUser: true" but settings already have a sentinel
-        if (!currentUser && isNewUser && settings) {
-          // There are existing settings on this profile.
-          // Since there is no sentinel yet, we will migrate them. Otherwise, if there is a sentinel, they shouldn't register.
+        // No sentinel exists yet in storage!
+        // To prevent accidental setup and enforce fail-closed security, require isNewUser to be true to establish a new sentinel.
+        if (!isNewUser) {
+          if (!currentUser) {
+            await logoutUser();
+          }
+          throw new Error("No secure workstation profile found for this therapist. If this is your first time, please click 'Establish clinical secret passcode' below to set up your master key.");
         }
 
         // Establish passcode sentinel for new user or returning migrated user

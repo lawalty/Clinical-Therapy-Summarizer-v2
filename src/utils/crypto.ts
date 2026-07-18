@@ -30,7 +30,7 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 }
 
 // Derive a cryptographic key from a passcode using PBKDF2 (raised to 600,000 iterations for OWASP/HIPAA alignment)
-async function deriveKey(passcode: string, salt: Uint8Array): Promise<CryptoKey> {
+async function deriveKey(passcode: string, salt: Uint8Array, iterations: number = 600000): Promise<CryptoKey> {
   const baseKey = await window.crypto.subtle.importKey(
     "raw",
     encoder.encode(passcode),
@@ -43,7 +43,7 @@ async function deriveKey(passcode: string, salt: Uint8Array): Promise<CryptoKey>
     {
       name: "PBKDF2",
       salt,
-      iterations: 600000, // OWASP guidance for strong password-based hashing
+      iterations, // Supports variable iterations for backwards compatibility with v1 data (100k)
       hash: "SHA-256",
     },
     baseKey,
@@ -65,7 +65,8 @@ export async function encryptText(cleartext: string, passcode: string): Promise<
   try {
     const salt = window.crypto.getRandomValues(new Uint8Array(16));
     const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(passcode, salt);
+    const iterations = 600000;
+    const key = await deriveKey(passcode, salt, iterations);
 
     const ciphertextBuffer = await window.crypto.subtle.encrypt(
       {
@@ -80,6 +81,7 @@ export async function encryptText(cleartext: string, passcode: string): Promise<
       ciphertext: arrayBufferToBase64(ciphertextBuffer),
       salt: arrayBufferToBase64(salt.buffer),
       iv: arrayBufferToBase64(iv.buffer),
+      iterations,
     };
 
     return JSON.stringify(payload);
@@ -115,8 +117,9 @@ export async function decryptText(encryptedPayload: string, passcode: string): P
     const ciphertext = base64ToArrayBuffer(payload.ciphertext);
     const salt = new Uint8Array(base64ToArrayBuffer(payload.salt));
     const iv = new Uint8Array(base64ToArrayBuffer(payload.iv));
+    const iterations = payload.iterations ?? 100000; // Fallback to 100,000 for v1-encrypted records
 
-    const key = await deriveKey(passcode, salt);
+    const key = await deriveKey(passcode, salt, iterations);
 
     const decryptedBuffer = await window.crypto.subtle.decrypt(
       {

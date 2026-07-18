@@ -301,6 +301,7 @@ export async function getTherapistSettings(userUid: string): Promise<TherapistSe
       }
     } catch (e) {
       console.error("Error retrieving settings from Firestore:", e);
+      throw new Error(`Failed to load settings from cloud store: ${(e as Error).message || "Transient Network Error"}`);
     }
     return null;
   } else {
@@ -312,19 +313,20 @@ export async function getTherapistSettings(userUid: string): Promise<TherapistSe
       } catch (e) {}
     }
 
-    const headers = await getAuthHeaders(userUid);
-    const response = await fetch("/api/settings", { headers });
-    if (!response.ok) {
-      return null;
-    }
     try {
+      const headers = await getAuthHeaders(userUid);
+      const response = await fetch("/api/settings", { headers });
+      if (!response.ok) {
+        throw new Error(`Server returned status ${response.status}`);
+      }
       const data = await response.json();
       if (data) {
         localStorage.setItem(`sandbox_settings_${userUid}`, JSON.stringify(data));
       }
       return data;
     } catch (e) {
-      return null;
+      console.error("Error retrieving settings from fallback server:", e);
+      throw new Error(`Failed to load settings from secure storage: ${(e as Error).message || "Transient Connection Error"}`);
     }
   }
 }

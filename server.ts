@@ -16,12 +16,33 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Setup Helmet security headers with CSP disabled for Vite Dev server and IFrame compliance
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false,
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-}));
+// Enable trusting proxy headers for accurate client IP identification (Finding E)
+app.set("trust proxy", 1);
+
+// Configure Helmet security headers with real production CSP and dev flexibility (Finding F)
+if (process.env.NODE_ENV === "production") {
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://apis.google.com", "https://*.googleapis.com"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "https://*.googleusercontent.com", "referrer"],
+        connectSrc: ["'self'", "https://*.googleapis.com", "https://*.firebaseapp.com", "https://*.identitytoolkit.com"],
+        frameAncestors: ["'self'", "https://ai.studio", "https://*.google.com"],
+      }
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+  }));
+} else {
+  app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+  }));
+}
 
 // Body parser with 15mb limit to restrict oversized payloads
 app.use(express.json({ limit: "15mb" }));
@@ -44,7 +65,7 @@ try {
   console.error("[AUTH] Firebase Admin initialization failed:", err);
 }
 
-// Authentication Middleware
+// Authentication Middleware (Finding A)
 const authenticateUser = async (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -53,10 +74,15 @@ const authenticateUser = async (req: any, res: any, next: any) => {
 
   const token = authHeader.split("Bearer ")[1];
   
-  // Accept client-side sandbox identifier
-  if (token.startsWith("sandbox-")) {
-    req.user = { uid: token, email: "sandbox@example.com" };
-    return next();
+  // Restrict sandbox token to the specific known client-side sandbox identifier
+  // and only accept it in local development/sandbox mode when Firebase Admin is not initialized
+  if (token === "sandbox-therapist-101") {
+    if (!firebaseAdminInitialized) {
+      req.user = { uid: token, email: "sandbox@example.com" };
+      return next();
+    } else {
+      return res.status(401).json({ error: "Sandbox access is disabled on this production environment" });
+    }
   }
 
   if (!firebaseAdminInitialized) {
@@ -80,7 +106,11 @@ const expensiveApiLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req: any) => {
-    return req.user?.uid || req.ip;
+    // If the authenticated identity is the sandbox therapist, rate limit by IP to prevent token rotation abuse
+    if (req.user?.uid === "sandbox-therapist-101") {
+      return req.ip || "sandbox-ip";
+    }
+    return req.user?.uid || req.ip || "unknown-ip";
   },
   message: { error: "Too many clinical synthesis requests. Please try again in 15 minutes." }
 });
@@ -362,8 +392,9 @@ app.get("/api/archives", authenticateUser, (req: any, res) => {
     
     let userArchives = [];
     if (Array.isArray(db)) {
-      // Migration path: if data is a legacy global flat list, deliver it for sandbox testing, but rewrite to keyed schema
-      userArchives = db;
+      // Discard global legacy array to prevent data leak (Finding D) and rewrite immediately
+      userArchives = [];
+      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
     } else {
       userArchives = db[uid] || [];
     }
@@ -384,8 +415,9 @@ app.post("/api/archives", authenticateUser, (req: any, res) => {
     const currentData = JSON.parse(fs.readFileSync(ARCHIVES_FILE, "utf-8"));
     let db: Record<string, any[]> = {};
     if (Array.isArray(currentData)) {
-      // Legacy migration
-      db[uid] = currentData;
+      // Discard legacy structure and rewrite immediately to protect data privacy
+      db = {};
+      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
     } else {
       db = currentData;
     }
@@ -417,7 +449,8 @@ app.delete("/api/archives/:id", authenticateUser, (req: any, res) => {
     
     let db: Record<string, any[]> = {};
     if (Array.isArray(currentData)) {
-      db[uid] = currentData.filter((item: any) => item.id !== id);
+      db = {};
+      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
     } else {
       db = currentData;
       if (db[uid]) {

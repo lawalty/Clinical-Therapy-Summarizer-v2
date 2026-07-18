@@ -92,6 +92,7 @@ export default function App() {
   // Status Banners
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
+  const [lockScreenError, setLockScreenError] = useState("");
   
   // Drag and drop helper
   const [isDragging, setIsDragging] = useState(false);
@@ -127,8 +128,8 @@ export default function App() {
     const resetTimer = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
+        setLockScreenError("Workstation locked automatically due to 15 minutes of inactivity.");
         handleSignOut();
-        setError("Workstation locked automatically due to 15 minutes of inactivity.");
       }, 15 * 60 * 1000);
     };
 
@@ -300,6 +301,7 @@ export default function App() {
   const handleUnlock = (authUser: TherapistUser, secretPasscode: string) => {
     setUser(authUser);
     setPasscode(secretPasscode);
+    setLockScreenError(""); // Clear any auto-lock error
     setSuccess("Workspace secure session initialized.");
     setTimeout(() => setSuccess(""), 4000);
   };
@@ -624,7 +626,7 @@ export default function App() {
 
   // If therapist hasn't unlocked the workstation, show lock screen
   if (!user || !passcode) {
-    return <LockScreen onUnlock={handleUnlock} currentUser={user} />;
+    return <LockScreen onUnlock={handleUnlock} currentUser={user} initialError={lockScreenError} />;
   }
 
   return (
@@ -880,7 +882,7 @@ export default function App() {
                           e.stopPropagation();
                           setArchiveToDelete({ id: arch.id, name: arch.name });
                         }}
-                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg opacity-0 group-hover:opacity-100 transition-all cursor-pointer shrink-0 ml-2"
+                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg md:opacity-0 group-hover:opacity-100 transition-all cursor-pointer shrink-0 ml-2"
                         title="Delete encrypted summary"
                         id={`archive-delete-${arch.id}`}
                       >
@@ -1140,7 +1142,7 @@ export default function App() {
                         onClick={() => {
                           setStyleInstructions(tmpl.instructions);
                           setActiveTemplateName(tmpl.name);
-                          setSettingsSavedStatus("saved");
+                          setSettingsSavedStatus("unsaved");
                         }}
                         className={`px-2.5 py-1 text-[10px] font-bold rounded-l-full border-y border-l transition-all cursor-pointer ${
                           activeTemplateName === tmpl.name
@@ -1203,7 +1205,7 @@ export default function App() {
               <div className="mt-3 p-3 bg-amber-50/50 border border-amber-200 rounded-xl flex gap-2 text-[10px] text-amber-800 leading-normal" id="security-assurance">
                 <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                 <p>
-                  These instructions guide the deep-thinking engine. Live API synthesis is transient and subject to the platform's standard data data privacy terms.
+                  These instructions guide the deep-thinking engine. Live API synthesis is transient and subject to standard data privacy terms.
                 </p>
               </div>
 
@@ -1361,7 +1363,7 @@ export default function App() {
             <span className="font-semibold text-slate-700">Clinical Workstation Vault</span>
           </div>
           <p id="footer-compliance-text" className="text-slate-400">
-            Secure client-side database encryption. All session processing paths utilize transient, unlogged AI generation.
+            All clinical archives are encrypted directly in your browser prior to database storage.
           </p>
         </div>
       </footer>
