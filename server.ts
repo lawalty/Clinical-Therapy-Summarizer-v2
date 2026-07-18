@@ -28,8 +28,8 @@ if (process.env.NODE_ENV === "production") {
         scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", "https://apis.google.com", "https://*.googleapis.com"],
         styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         fontSrc: ["'self'", "https://fonts.gstatic.com"],
-        imgSrc: ["'self'", "data:", "https://*.googleusercontent.com", "referrer"],
-        connectSrc: ["'self'", "https://*.googleapis.com", "https://*.firebaseapp.com", "https://*.identitytoolkit.com"],
+        imgSrc: ["'self'", "data:", "https://*.googleusercontent.com"],
+        connectSrc: ["'self'", "https://*.googleapis.com", "https://*.firebaseapp.com"],
         frameAncestors: ["'self'", "https://ai.studio", "https://*.google.com"],
       }
     },
@@ -105,6 +105,7 @@ const expensiveApiLimiter = rateLimit({
   max: 50, // Limit each clinician session to 50 requests per window
   standardHeaders: true,
   legacyHeaders: false,
+  validate: false,
   keyGenerator: (req: any) => {
     // If the authenticated identity is the sandbox therapist, rate limit by IP to prevent token rotation abuse
     if (req.user?.uid === "sandbox-therapist-101") {
@@ -248,6 +249,7 @@ app.post("/api/summarize", authenticateUser, expensiveApiLimiter, async (req, re
       includeInsights = true,
       focusAreas = [],
       hideSubtitles = false,
+      patientName,
     } = req.body;
 
     if (!extractedText) {
@@ -255,6 +257,11 @@ app.post("/api/summarize", authenticateUser, expensiveApiLimiter, async (req, re
     }
 
     const ai = getGeminiClient();
+
+    // Humanized patient reference instruction
+    const humanizedDirective = patientName && patientName.trim()
+      ? `7. HUMANIZED CLIENT REFERENCE (CRITICAL): To establish a humanized clinical connection, refer to the client/patient directly as "${patientName.trim()}" throughout the generated progress note and insights sections (e.g. use "S: ${patientName.trim()} stated...", "O: ${patientName.trim()} presented with...", etc.). Do NOT refer to them using cold or generic placeholders like "the client", "the patient", "Client", or "Patient". Refer to them by name or appropriate third-person pronouns (e.g. he/she/they) as grammatically suited.`
+      : `7. Maintain professional documentation standards: Refer to the client/patient respectfully using third-person phrasing (e.g. "the client", "the patient").`;
 
     // Construct framework descriptions and system prompt
     let frameworkPrompt = "";
@@ -308,10 +315,12 @@ Your task is to synthesize the provided session notes, files, or transcript into
 
 Strict Clinical Guidelines:
 1. Maintain professional, formal, objective language. Avoid emotional descriptions of your own; instead, describe therapist interventions objectively.
-2. Maintain high-level privacy: avoid including unnecessary identifying patient information unless absolutely relevant, and focus purely on clinical progress.
+2. Maintain high-level privacy: focus purely on clinical progress.
 3. Tone of the output: ${tone} (e.g., clinical, academic, collaborative).
 4. Desired length: ${length} (strictly adhere to generating approximately ${quantity} paragraphs or equivalent sub-sections per category).
 5. ABSOLUTE CONSTRAINT: Do NOT use ANY markdown formatting in your response. Do not use double asterisks (**), single asterisks (*), markdown headers (#, ##, etc.), markdown lists, bolding, italics, or any other markdown syntax. All headers or section titles must be plain text capital letters followed by a colon or a simple line break (for example, use "S (Subjective):" or "O (Objective):" instead of "**S (Subjective)**:" or "**O (Objective)**:"). Ensure the entire text is clean, pure text ready for direct copying and pasting into standard text areas without any syntax clutter.
+
+${humanizedDirective}
 
 ${subtitlesConstraint}
 

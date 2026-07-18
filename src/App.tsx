@@ -21,7 +21,8 @@ import {
   Info,
   Lock,
   Plus,
-  X
+  X,
+  ShieldCheck
 } from "lucide-react";
 
 import { 
@@ -42,6 +43,61 @@ import { CLINICAL_TEMPLATES } from "./components/InstructionTemplates";
 import LockScreen from "./components/LockScreen";
 import { motion, AnimatePresence } from "motion/react";
 
+// Robust client-side helper to extract the patient's name from clinical session notes
+function extractPatientName(text: string): string {
+  if (!text) return "";
+
+  // 1. Look for common field patterns: "Patient: John Doe" or "Client Name: Doe, Jane"
+  const nameLabels = [
+    /(?:patient's|client's|patient|client)\s*name\s*[:=-]\s*([^\n\r]+)/i,
+    /(?:patient|client|name)\s*[:=-]\s*([^\n\r]+)/i,
+    /for\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:evaluation|session|treatment|therapy)/i,
+    /(?:client|patient)\s+is\s+a\s+[^.]+?named\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
+    /(?:client|patient)\s+is\s+a\s+\d+-year-old\s+[^.]+?named\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
+    /(?:client|patient)\s+([A-Z][a-z]+)\s+presented\s+for/i,
+  ];
+
+  for (const pattern of nameLabels) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      const name = match[1].trim()
+        .replace(/^(is|was|presented|presents|named)\s+/i, "")
+        .replace(/[.,;]$/, "")
+        .trim();
+      if (name && name.length >= 2 && name.length < 50 && !/^(subjective|objective|assessment|plan|the|client|patient)$/i.test(name)) {
+        return name;
+      }
+    }
+  }
+
+  // 2. Scan lines for "Patient: ..." or "Client: ..." explicitly
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/^(?:client|patient|name)\s*:\s*([^\n\r]+)/i);
+    if (match && match[1]) {
+      const name = match[1].trim().replace(/[.,;]$/, "");
+      if (name && name.length >= 2 && name.length < 50) {
+        return name;
+      }
+    }
+  }
+
+  // 3. Look for the first capital word in the first line if it is not a common stopword
+  if (lines.length > 0) {
+    const firstLine = lines[0];
+    const words = firstLine.split(/[\s,;().]+/).filter(Boolean);
+    for (const word of words) {
+      if (/^[A-Z][a-z]+$/.test(word)) {
+        if (!/^(Client|Patient|The|He|She|Subjective|Objective|Assessment|Plan|S|O|A|P|D|B|I|R|G)$/i.test(word)) {
+          return word;
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
 export default function App() {
   const [user, setUser] = useState<TherapistUser | null>(null);
   const [passcode, setPasscode] = useState<string | null>(null);
@@ -56,6 +112,7 @@ export default function App() {
   
   // Clinical Inputs
   const [verbatimText, setVerbatimText] = useState("");
+  const [patientNameInput, setPatientNameInput] = useState("");
   const [generatedSummary, setGeneratedSummary] = useState("");
   const [framework, setFramework] = useState("SOAP");
   const [length, setLength] = useState("medium");
@@ -84,6 +141,9 @@ export default function App() {
 
   // Delete archive custom modal state
   const [archiveToDelete, setArchiveToDelete] = useState<{ id: string; name: string } | null>(null);
+
+  // Save/Encrypt archive custom modal state
+  const [isSaveModalOpen, setIsSaveModalOpen] = useState(false);
 
   // Therapist settings persistence states
   const [isSavingSettings, setIsSavingSettings] = useState(false);
@@ -119,6 +179,18 @@ export default function App() {
       loadTherapistSettings();
     }
   }, [user]);
+
+  // Synchronize detected patient name when verbatimText updates
+  useEffect(() => {
+    if (verbatimText) {
+      const detected = extractPatientName(verbatimText);
+      if (detected) {
+        setPatientNameInput(detected);
+      }
+    } else {
+      setPatientNameInput("");
+    }
+  }, [verbatimText]);
 
   // Inactivity Auto-Lock (Locks session after 15 minutes of inactivity)
   useEffect(() => {
@@ -322,6 +394,7 @@ export default function App() {
     setArchives([]);
     setCurrentArchive(null);
     setVerbatimText("");
+    setPatientNameInput("");
     setGeneratedSummary("");
     setArchiveNameInput("");
     setStyleInstructions(CLINICAL_TEMPLATES[0].instructions);
@@ -437,7 +510,8 @@ export default function App() {
           tone,
           includeInsights,
           focusAreas,
-          hideSubtitles
+          hideSubtitles,
+          patientName: patientNameInput
         })
       });
 
@@ -447,14 +521,16 @@ export default function App() {
       }
 
       setGeneratedSummary(result.summary || "");
-      if (!archiveNameInput.trim()) {
-        const todayStr = new Date().toLocaleDateString(undefined, {
-          month: "short",
-          day: "numeric",
-          year: "numeric"
-        });
-        setArchiveNameInput(`Patient Note - ${framework} - ${todayStr}`);
-      }
+      const pName = patientNameInput || extractPatientName(verbatimText) || extractPatientName(result.summary || "");
+      const todayStr = new Date().toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric"
+      });
+      const defaultName = pName 
+        ? `${pName} - ${framework} - ${todayStr}`
+        : `Patient Note - ${framework} - ${todayStr}`;
+      setArchiveNameInput(defaultName);
       if (result.fallbackUsed) {
         setSuccess("Session summary generated successfully (using optimized standard quota model).");
       } else {
@@ -466,6 +542,25 @@ export default function App() {
     } finally {
       setIsSummarizing(false);
     }
+  };
+
+  // Triggered when clicking "Encrypt & Save Archive" button
+  const handleOpenSaveModal = () => {
+    if (currentArchive) {
+      setArchiveNameInput(currentArchive.name);
+    } else {
+      const pName = extractPatientName(verbatimText) || extractPatientName(generatedSummary);
+      const todayStr = new Date().toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric"
+      });
+      const defaultName = pName 
+        ? `${pName} - ${framework} - ${todayStr}`
+        : `Patient Note - ${framework} - ${todayStr}`;
+      setArchiveNameInput(defaultName);
+    }
+    setIsSaveModalOpen(true);
   };
 
   // Client-side Encrypt and Save/Update Archive
@@ -489,7 +584,7 @@ export default function App() {
       const encryptedContent = await encryptText(generatedSummary, passcode);
       const encryptedNotes = await encryptText(verbatimText, passcode);
 
-      // Generate a collision-resistant UUID (HIPAA best practice)
+      // Generate a collision-resistant UUID
       const archiveId = currentArchive?.id || window.crypto.randomUUID();
       const payload: ClinicalArchive = {
         id: archiveId,
@@ -508,6 +603,7 @@ export default function App() {
       await loadArchives();
       setCurrentArchive(payload);
       setSuccess(`Archived successfully under "${archiveNameInput}". Records are encrypted.`);
+      setIsSaveModalOpen(false); // Close modal on success
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Failed to encrypt and archive records.");
@@ -568,6 +664,7 @@ export default function App() {
     setArchiveNameInput("");
     setGeneratedSummary("");
     setVerbatimText("");
+    setPatientNameInput("");
     setError("");
     setSuccess("Cleared workspace for a new clinical session.");
     setTimeout(() => setSuccess(""), 4000);
@@ -823,6 +920,32 @@ export default function App() {
                 className="w-full flex-1 min-h-[150px] bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-600 placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:bg-white resize-none font-sans leading-relaxed"
                 id="verbatim-textarea"
               />
+
+              {/* Detected Client Name Box */}
+              <div className="mt-3 bg-indigo-50/50 border border-indigo-100/60 rounded-xl p-3 space-y-2 shrink-0" id="patient-name-extractor-box">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] font-bold text-indigo-800 uppercase tracking-wider flex items-center gap-1.5" htmlFor="patient-name-field">
+                    <span>Humanized Client Name</span>
+                  </label>
+                  {patientNameInput && (
+                    <span className="text-[9px] font-medium bg-indigo-100 text-indigo-700 px-1.5 py-0.5 rounded-full animate-pulse">
+                      Identified
+                    </span>
+                  )}
+                </div>
+                <input
+                  id="patient-name-field"
+                  type="text"
+                  placeholder="e.g. Chavez (Used to humanize generated summary notes)"
+                  value={patientNameInput}
+                  onChange={(e) => setPatientNameInput(e.target.value)}
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 font-medium"
+                />
+                <p className="text-[9px] text-slate-400 leading-normal">
+                  Our system will instruct Gemini to refer to the client as <strong className="text-slate-600">"{patientNameInput || "this client"}"</strong> instead of generic terms throughout the generated note.
+                </p>
+              </div>
+
               <p className="text-[10px] text-slate-400 mt-2 leading-tight" id="notes-compliance-reminder">
                 Note: This textbox represents the raw session details that the AI summarizer will analyze. Keep client names minimized to protect privacy.
               </p>
@@ -1327,22 +1450,13 @@ export default function App() {
                   Clear Workspace
                 </button>
                 <button
-                  onClick={handleSaveArchive}
+                  onClick={handleOpenSaveModal}
                   disabled={isSaving || (!generatedSummary && !verbatimText)}
                   className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
                   id="archive-save-btn"
                 >
-                  {isSaving ? (
-                    <>
-                      <span className="w-3 h-3 border border-white/30 border-t-white rounded-full animate-spin" />
-                      <span>Encrypting...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Lock className="w-3 h-3 text-white" />
-                      <span>{currentArchive ? "Update Encrypted Archive" : "Encrypt & Save Archive"}</span>
-                    </>
-                  )}
+                  <Lock className="w-3 h-3 text-white" />
+                  <span>{currentArchive ? "Update Encrypted Archive" : "Encrypt & Save Archive"}</span>
                 </button>
               </div>
             </div>
@@ -1367,6 +1481,88 @@ export default function App() {
           </p>
         </div>
       </footer>
+
+      {/* ------------------- CONFIRM ENCRYPT & SAVE ARCHIVE MODAL ------------------- */}
+      {isSaveModalOpen && (
+        <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" id="save-archive-modal-overlay">
+          <div className="bg-white rounded-2xl shadow-xl max-w-md w-full border border-slate-200 overflow-hidden transform transition-all scale-100 animate-in fade-in zoom-in duration-150" id="save-archive-modal-content">
+            <div className="flex items-center justify-between border-b border-slate-100 px-6 py-4 bg-slate-50" id="save-archive-header">
+              <h3 className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-indigo-600" />
+                <span>{currentArchive ? "Update Encrypted Archive" : "Encrypt & Save Archive"}</span>
+              </h3>
+              <button 
+                onClick={() => setIsSaveModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-colors cursor-pointer"
+                id="close-save-archive-btn"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-4" id="save-archive-body">
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Confirm or customize the archive name before securing this record. All contents are encrypted using your clinical passcode (AES-GCM 256) directly inside your web browser prior to database upload.
+              </p>
+
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider" htmlFor="save-archive-name-input">
+                  Archive Name
+                </label>
+                <input 
+                  id="save-archive-name-input"
+                  type="text"
+                  placeholder="e.g. Patient J.S. - Session 10"
+                  value={archiveNameInput}
+                  onChange={(e) => setArchiveNameInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      handleSaveArchive();
+                    }
+                  }}
+                  className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 font-medium"
+                  autoFocus
+                />
+              </div>
+
+              {error && (
+                <div className="flex items-start gap-1.5 p-2.5 bg-rose-50 border border-rose-100 rounded-lg text-[10px] text-rose-700 leading-normal" id="save-modal-error">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-rose-500 mt-0.5" />
+                  <span>{error}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="border-t border-slate-100 px-6 py-4 bg-slate-50 flex items-center justify-end gap-3" id="save-archive-footer">
+              <button 
+                onClick={() => setIsSaveModalOpen(false)}
+                className="px-4 py-2 text-slate-500 hover:bg-slate-100 border border-slate-200 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                id="cancel-save-archive-btn"
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={handleSaveArchive}
+                disabled={isSaving}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                id="confirm-save-archive-btn"
+              >
+                {isSaving ? (
+                  <>
+                    <span className="w-3 h-3 border border-white/30 border-t-white rounded-full animate-spin" />
+                    <span>Encrypting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>{currentArchive ? "Update & Encrypt" : "Encrypt & Persist"}</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ------------------- CUSTOM STYLED DELETE CONFIRMATION MODAL ------------------- */}
       {archiveToDelete && (

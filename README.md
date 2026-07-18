@@ -6,7 +6,7 @@ ClinicianFlow AI is a high-security, client-side encrypted psychotherapy session
 
 ## 🔒 Key Security & Privacy Safeguards
 
-- **Zero-Knowledge Browser-Based Encryption**: All sensitive patient data, session summaries, and clinician archives are encrypted directly in the clinician's browser via the Web Crypto API using AES-GCM 256 prior to being stored in the database.
+- **Client-Side Encrypted Storage**: All sensitive patient data, session summaries, and clinician archives are encrypted directly in the clinician's browser via the Web Crypto API using AES-GCM 256 prior to being stored in the database.
 - **Fail-Closed Passcode Sentinels**: Master passcode verification checks are carried out securely on every login via a salted, high-iteration (600,000 PBKDF2 iterations) cryptographic sentinel, with instant fall-closed safeguards on transient network failures.
 - **Backwards Compatibility**: Cryptographic payload versioning dynamically falls back to 100,000 PBKDF2 iterations for legacy records while seamlessly securing new clinical documents at 600,000 iterations.
 - **Server-Side Firebase Verification**: Authentic and verified user identity validation prevents token-rotation and sandbox auth bypasses, and rate limits heavy requests per clinical IP and account.
