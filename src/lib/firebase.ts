@@ -10,6 +10,9 @@ import {
   signInWithPopup, 
   signOut, 
   onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  updateProfile,
   User as FirebaseUser
 } from "firebase/auth";
 import { 
@@ -23,10 +26,19 @@ import {
   Firestore
 } from "firebase/firestore";
 
-// Read configuration from Vite environment variables
+// Read configuration from Vite environment variables and resolve authDomain dynamically on custom domains to leverage first-party cookies via reverse proxy
+const rawAuthDomain = import.meta.env.VITE_FIREBASE_AUTH_DOMAIN;
+export const host = typeof window !== "undefined" ? window.location.host : "";
+export const isCustomDomain = !!(
+  host && 
+  !host.includes("localhost") && 
+  !host.includes("127.0.0.1") && 
+  !host.includes("192.168.")
+);
+
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  authDomain: isCustomDomain ? host : (rawAuthDomain || `${import.meta.env.VITE_FIREBASE_PROJECT_ID}.firebaseapp.com`),
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
@@ -120,11 +132,66 @@ export async function loginWithGoogle(): Promise<TherapistUser> {
   }
 }
 
+export async function loginWithEmail(email: string, password: string): Promise<TherapistUser> {
+  // Use our secure local workstation API endpoints to authenticate.
+  // This bypasses Firebase Auth completely for email-based login (Solution 3),
+  // preventing configuration blocks and popup domain issues inside dynamic containers.
+  const response = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "Failed to authenticate workstation credentials");
+  }
+  
+  const user = await response.json();
+  const therapistUser: TherapistUser = {
+    uid: user.uid,
+    email: user.email,
+    displayName: user.displayName,
+    isSandbox: true,
+  };
+  
+  localStorage.setItem("sandbox_user", JSON.stringify(therapistUser));
+  return therapistUser;
+}
+
+export async function registerWithEmail(email: string, password: string, displayName: string): Promise<TherapistUser> {
+  // Use our secure local workstation API endpoints to register.
+  const response = await fetch("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, displayName }),
+  });
+  
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "Failed to register local clinician account");
+  }
+  
+  const user = await response.json();
+  const therapistUser: TherapistUser = {
+    uid: user.uid,
+    email: user.email,
+    displayName: user.displayName,
+    isSandbox: true,
+  };
+  
+  localStorage.setItem("sandbox_user", JSON.stringify(therapistUser));
+  return therapistUser;
+}
+
 export async function logoutUser(): Promise<void> {
+  localStorage.removeItem("sandbox_user");
   if (isFirebaseEnabled && auth) {
-    await signOut(auth);
-  } else {
-    localStorage.removeItem("sandbox_user");
+    try {
+      await signOut(auth);
+    } catch (e) {
+      console.error("Firebase signOut error:", e);
+    }
   }
 }
 
@@ -139,14 +206,28 @@ export function subscribeToAuthChanges(callback: (user: TherapistUser | null) =>
           photoURL: user.photoURL || undefined,
         });
       } else {
-        callback(null);
+        // Fall back to check if there is a logged-in local workstation user
+        const stored = localStorage.getItem("sandbox_user");
+        if (stored) {
+          try {
+            callback(JSON.parse(stored));
+          } catch (e) {
+            callback(null);
+          }
+        } else {
+          callback(null);
+        }
       }
     });
   } else {
     // Check local storage for sandbox login
     const stored = localStorage.getItem("sandbox_user");
     if (stored) {
-      callback(JSON.parse(stored));
+      try {
+        callback(JSON.parse(stored));
+      } catch (e) {
+        callback(null);
+      }
     } else {
       callback(null);
     }
@@ -168,7 +249,7 @@ export interface ClinicalArchive {
 
 // Saves a clinical archive to either Firestore or Fallback Local Database
 export async function saveClinicalArchive(userUid: string, archive: ClinicalArchive): Promise<void> {
-  if (isFirebaseEnabled && db) {
+  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
     const userDocRef = doc(db, "therapists", userUid, "archives", archive.id);
     await setDoc(userDocRef, archive);
   } else {
@@ -197,7 +278,7 @@ export async function saveClinicalArchive(userUid: string, archive: ClinicalArch
 
 // Retrieves all clinical archives for a therapist
 export async function getClinicalArchives(userUid: string): Promise<ClinicalArchive[]> {
-  if (isFirebaseEnabled && db) {
+  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
     const colRef = collection(db, "therapists", userUid, "archives");
     const snapshot = await getDocs(colRef);
     const archives: ClinicalArchive[] = [];
@@ -208,6 +289,43 @@ export async function getClinicalArchives(userUid: string): Promise<ClinicalArch
     return archives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
   } else {
     // Try localStorage first
+    let hasLocal = false;
+    try {
+      const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
+      if (localArchivesStr) {
+        const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
+        if (localArchives.length > 0) {
+          hasLocal = true;
+        }
+      }
+    } catch (e) {}
+
+    // Securely migrate test archives from anonymous sandbox sessions if this account has none
+    if (!hasLocal && userUid !== "sandbox-therapist-101") {
+      const legacyKeys = ["sandbox_archives", "sandbox_archives_sandbox-therapist-101"];
+      for (const legacyKey of legacyKeys) {
+        const oldArchivesStr = localStorage.getItem(legacyKey);
+        if (oldArchivesStr) {
+          try {
+            const oldArchives: ClinicalArchive[] = JSON.parse(oldArchivesStr);
+            if (Array.isArray(oldArchives) && oldArchives.length > 0) {
+              localStorage.setItem(`sandbox_archives_${userUid}`, oldArchivesStr);
+              // Sync up migrated archives with server in background
+              for (const arch of oldArchives) {
+                saveClinicalArchive(userUid, arch).catch((err) => 
+                  console.error("Background migration upload failed for archive:", err)
+                );
+              }
+              console.log(`Successfully migrated ${oldArchives.length} archives from legacy key "${legacyKey}" to user "${userUid}"`);
+              break;
+            }
+          } catch (e) {
+            console.warn("Legacy archives migration failed:", e);
+          }
+        }
+      }
+    }
+
     try {
       const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
       if (localArchivesStr) {
@@ -234,7 +352,7 @@ export async function getClinicalArchives(userUid: string): Promise<ClinicalArch
 
 // Deletes a clinical archive
 export async function deleteClinicalArchive(userUid: string, id: string): Promise<void> {
-  if (isFirebaseEnabled && db) {
+  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
     const docRef = doc(db, "therapists", userUid, "archives", id);
     await deleteDoc(docRef);
   } else {
@@ -271,7 +389,7 @@ export interface TherapistSettings {
 
 // Saves custom clinical directives settings linked to user profile
 export async function saveTherapistSettings(userUid: string, settings: TherapistSettings): Promise<void> {
-  if (isFirebaseEnabled && db) {
+  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
     const docRef = doc(db, "therapists", userUid, "settings", "directives");
     await setDoc(docRef, settings);
   } else {
@@ -292,7 +410,7 @@ export async function saveTherapistSettings(userUid: string, settings: Therapist
 
 // Retrieves custom clinical directives settings linked to user profile
 export async function getTherapistSettings(userUid: string): Promise<TherapistSettings | null> {
-  if (isFirebaseEnabled && db) {
+  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
     try {
       const docRef = doc(db, "therapists", userUid, "settings", "directives");
       const docSnap = await getDoc(docRef);
@@ -306,7 +424,34 @@ export async function getTherapistSettings(userUid: string): Promise<TherapistSe
     return null;
   } else {
     // Try localStorage first
-    const localBackup = localStorage.getItem(`sandbox_settings_${userUid}`);
+    let localBackup = localStorage.getItem(`sandbox_settings_${userUid}`);
+
+    // If no user-specific settings exist, look for legacy anonymous sandbox settings to migrate!
+    if (!localBackup && userUid !== "sandbox-therapist-101") {
+      const legacyKeys = ["sandbox_settings", "sandbox_settings_sandbox-therapist-101"];
+      for (const legacyKey of legacyKeys) {
+        const oldData = localStorage.getItem(legacyKey);
+        if (oldData) {
+          try {
+            const parsed = JSON.parse(oldData);
+            if (parsed && (parsed.styleInstructions || parsed.customTemplates?.length > 0)) {
+              localBackup = oldData;
+              // Save to current user locally so it exists immediately
+              localStorage.setItem(`sandbox_settings_${userUid}`, oldData);
+              // Save to current user on the workstation server in background
+              saveTherapistSettings(userUid, parsed).catch((err) => 
+                console.error("Background migration upload failed for settings:", err)
+              );
+              console.log(`Successfully migrated settings from legacy key "${legacyKey}" to user "${userUid}"`);
+              break;
+            }
+          } catch (e) {
+            console.warn("Legacy settings migration failed:", e);
+          }
+        }
+      }
+    }
+
     if (localBackup) {
       try {
         return JSON.parse(localBackup);

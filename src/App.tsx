@@ -98,6 +98,36 @@ function extractPatientName(text: string): string {
   return "";
 }
 
+// Formats the humanized patient name according to selected format option (full name, first name, last name)
+function getFormattedPatientName(fullName: string, option: "full" | "first" | "last"): string {
+  if (!fullName) return "";
+  const cleaned = fullName.trim();
+  
+  // Check if comma exists (e.g., "Chavez, Ricardo" or "Doe, John")
+  if (cleaned.includes(",")) {
+    const parts = cleaned.split(",").map(p => p.trim());
+    const lastName = parts[0];
+    const firstName = parts.slice(1).join(" ").trim();
+    
+    if (option === "first") return firstName || cleaned;
+    if (option === "last") return lastName || cleaned;
+    return cleaned;
+  }
+  
+  // Standard space separated (e.g., "Ricardo Chavez" or "John Doe" or "Sarah Jenkins")
+  const parts = cleaned.split(/\s+/);
+  if (parts.length <= 1) {
+    return cleaned; // Only one name entered, return as is
+  }
+  
+  const firstName = parts[0];
+  const lastName = parts.slice(1).join(" ");
+  
+  if (option === "first") return firstName;
+  if (option === "last") return lastName;
+  return cleaned;
+}
+
 export default function App() {
   const [user, setUser] = useState<TherapistUser | null>(null);
   const [passcode, setPasscode] = useState<string | null>(null);
@@ -113,6 +143,8 @@ export default function App() {
   // Clinical Inputs
   const [verbatimText, setVerbatimText] = useState("");
   const [patientNameInput, setPatientNameInput] = useState("");
+  const [basePatientName, setBasePatientName] = useState("");
+  const [patientNameFormat, setPatientNameFormat] = useState<"full" | "first" | "last">("full");
   const [generatedSummary, setGeneratedSummary] = useState("");
   const [framework, setFramework] = useState("SOAP");
   const [length, setLength] = useState("medium");
@@ -185,9 +217,11 @@ export default function App() {
     if (verbatimText) {
       const detected = extractPatientName(verbatimText);
       if (detected) {
-        setPatientNameInput(detected);
+        setBasePatientName(detected);
+        setPatientNameInput(getFormattedPatientName(detected, patientNameFormat));
       }
     } else {
+      setBasePatientName("");
       setPatientNameInput("");
     }
   }, [verbatimText]);
@@ -521,7 +555,8 @@ export default function App() {
       }
 
       setGeneratedSummary(result.summary || "");
-      const pName = patientNameInput || extractPatientName(verbatimText) || extractPatientName(result.summary || "");
+      const formattedName = patientNameInput;
+      const pName = formattedName || extractPatientName(verbatimText) || extractPatientName(result.summary || "");
       const todayStr = new Date().toLocaleDateString(undefined, {
         month: "short",
         day: "numeric",
@@ -938,11 +973,39 @@ export default function App() {
                   type="text"
                   placeholder="e.g. Chavez (Used to humanize generated summary notes)"
                   value={patientNameInput}
-                  onChange={(e) => setPatientNameInput(e.target.value)}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setPatientNameInput(val);
+                    setBasePatientName(val);
+                  }}
                   className="w-full bg-white border border-slate-200 rounded-lg px-3 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 font-medium"
                 />
+
+                {/* Patient Name Format Selector */}
+                <div className="flex items-center gap-1.5 py-1" id="name-format-options">
+                  <span className="text-[9px] text-slate-400 font-bold uppercase tracking-wider">Format:</span>
+                  {(["full", "first", "last"] as const).map((opt) => (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => {
+                        setPatientNameFormat(opt);
+                        setPatientNameInput(getFormattedPatientName(basePatientName, opt));
+                      }}
+                      className={`px-2 py-0.5 text-[9px] font-bold rounded-md border transition-all cursor-pointer ${
+                        patientNameFormat === opt
+                          ? "bg-indigo-600 border-indigo-600 text-white shadow-xs"
+                          : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                      }`}
+                      id={`name-format-btn-${opt}`}
+                    >
+                      {opt === "full" ? "full name" : opt === "first" ? "first name" : "last name"}
+                    </button>
+                  ))}
+                </div>
+
                 <p className="text-[9px] text-slate-400 leading-normal">
-                  Our system will instruct Gemini to refer to the client as <strong className="text-slate-600">"{patientNameInput || "this client"}"</strong> instead of generic terms throughout the generated note.
+                  Our system will instruct Gemini to refer to the client as <strong className="text-indigo-600">"{patientNameInput || "this client"}"</strong> instead of generic terms throughout the generated note.
                 </p>
               </div>
 

@@ -8,8 +8,10 @@ import dotenv from "dotenv";
 import mammoth from "mammoth";
 import { initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
+import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
+import proxy from "express-http-proxy";
 
 dotenv.config();
 
@@ -18,6 +20,25 @@ const PORT = Number(process.env.PORT) || 3000;
 
 // Enable trusting proxy headers for accurate client IP identification (Finding E)
 app.set("trust proxy", 1);
+
+// Proxy Firebase Auth /__/auth endpoint requests to the default Firebase authDomain to prevent third-party cookie blocking
+const firebaseAuthDomain = process.env.VITE_FIREBASE_AUTH_DOMAIN || (process.env.VITE_FIREBASE_PROJECT_ID ? `${process.env.VITE_FIREBASE_PROJECT_ID}.firebaseapp.com` : "");
+if (firebaseAuthDomain) {
+  const targetDomain = firebaseAuthDomain.replace(/^https?:\/\//, "");
+  console.log(`[AUTH] Setting up reverse proxy for /__/auth/ to ${targetDomain}`);
+  app.use("/__/auth", proxy(targetDomain, {
+    preserveHostHdr: false,
+    proxyReqPathResolver: (req) => {
+      return `/__/auth${req.url}`;
+    },
+    proxyReqOptDecorator: (proxyReqOpts, srcReq) => {
+      if (proxyReqOpts.headers) {
+        proxyReqOpts.headers["host"] = targetDomain;
+      }
+      return proxyReqOpts;
+    }
+  }));
+}
 
 // Configure Helmet security headers with real production CSP and dev flexibility (Finding F)
 if (process.env.NODE_ENV === "production") {
@@ -65,6 +86,17 @@ try {
   console.error("[AUTH] Firebase Admin initialization failed:", err);
 }
 
+// Safely initialize Firestore Admin reference
+let adminDb: any = null;
+if (firebaseAdminInitialized) {
+  try {
+    adminDb = getAdminFirestore();
+    console.log("[DATABASE] Firebase Admin Firestore initialized successfully.");
+  } catch (err) {
+    console.error("[DATABASE] Failed to initialize Admin Firestore:", err);
+  }
+}
+
 // Authentication Middleware (Finding A)
 const authenticateUser = async (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
@@ -75,14 +107,54 @@ const authenticateUser = async (req: any, res: any, next: any) => {
   const token = authHeader.split("Bearer ")[1];
   
   // Restrict sandbox token to the specific known client-side sandbox identifier
-  // and only accept it in local development/sandbox mode when Firebase Admin is not initialized
-  if (token === "sandbox-therapist-101") {
-    if (!firebaseAdminInitialized) {
-      req.user = { uid: token, email: "sandbox@example.com" };
-      return next();
-    } else {
-      return res.status(401).json({ error: "Sandbox access is disabled on this production environment" });
+  // or local secure tokens generated during registration/login
+  if (token === "sandbox-therapist-101" || token.startsWith("local-")) {
+    let email = "sandbox@example.com";
+    let userFound = false;
+
+    // 1. Check Firestore first if available
+    if (adminDb) {
+      try {
+        const userDoc = await adminDb.collection("workstationUsers").doc(token).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          email = userData.email;
+          userFound = true;
+        }
+      } catch (err) {
+        console.error("[AUTH] Firestore verification failed for local user:", err);
+      }
     }
+
+    // 2. Fallback to local files
+    if (!userFound) {
+      try {
+        if (fs.existsSync(USERS_FILE)) {
+          const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+          const user = Object.values(users).find((u: any) => u.uid === token) as any;
+          if (user) {
+            email = user.email;
+            userFound = true;
+
+            // Background sync to Firestore so it's permanently persisted
+            if (adminDb) {
+              adminDb.collection("workstationUsers").doc(token).set(user).catch((err: any) =>
+                console.error("[AUTH] Background sync to Firestore failed during auth:", err)
+              );
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[AUTH] Local user store read error:", e);
+      }
+    }
+
+    if (!userFound) {
+      return res.status(401).json({ error: "Local therapist profile not found or expired. Please sign in again." });
+    }
+
+    req.user = { uid: token, email: email };
+    return next();
   }
 
   if (!firebaseAdminInitialized) {
@@ -151,6 +223,7 @@ const formatGeminiError = (error: any, defaultMessage: string): string => {
 const DATA_DIR = path.join(process.cwd(), "data");
 const ARCHIVES_FILE = path.join(DATA_DIR, "archives.json");
 const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
+const USERS_FILE = path.join(DATA_DIR, "users.json");
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -161,6 +234,9 @@ if (!fs.existsSync(ARCHIVES_FILE)) {
 }
 if (!fs.existsSync(SETTINGS_FILE)) {
   fs.writeFileSync(SETTINGS_FILE, JSON.stringify({}));
+}
+if (!fs.existsSync(USERS_FILE)) {
+  fs.writeFileSync(USERS_FILE, JSON.stringify({}));
 }
 
 // ------------------- API ROUTES -------------------
@@ -393,27 +469,63 @@ Generate the highly secure, pristine session summary note below following your c
 });
 
 // 3. Fallback Local Storage APIs (CRUD - scoped by verified uid)
-app.get("/api/archives", authenticateUser, (req: any, res) => {
+app.get("/api/archives", authenticateUser, async (req: any, res) => {
   try {
     const uid = req.user.uid;
-    const data = fs.readFileSync(ARCHIVES_FILE, "utf-8");
-    const db = JSON.parse(data);
-    
-    let userArchives = [];
-    if (Array.isArray(db)) {
-      // Discard global legacy array to prevent data leak (Finding D) and rewrite immediately
-      userArchives = [];
-      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
-    } else {
-      userArchives = db[uid] || [];
+    let userArchives: any[] = [];
+    let fetchedFromFirestore = false;
+
+    // 1. Try Firestore first
+    if (adminDb) {
+      try {
+        const querySnapshot = await adminDb.collection("therapists").doc(uid).collection("archives").get();
+        if (!querySnapshot.empty) {
+          querySnapshot.forEach((doc: any) => {
+            userArchives.push(doc.data());
+          });
+          fetchedFromFirestore = true;
+        }
+      } catch (err) {
+        console.error("[ARCHIVES] Error reading archives from Firestore:", err);
+      }
     }
+
+    // 2. Fallback to local files
+    if (!fetchedFromFirestore || userArchives.length === 0) {
+      try {
+        const data = fs.readFileSync(ARCHIVES_FILE, "utf-8");
+        const db = JSON.parse(data);
+        
+        if (Array.isArray(db)) {
+          userArchives = [];
+          fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
+        } else {
+          userArchives = db[uid] || [];
+        }
+
+        // Background sync to Firestore if we have records and Firestore is active
+        if (userArchives.length > 0 && adminDb) {
+          for (const archive of userArchives) {
+            adminDb.collection("therapists").doc(uid).collection("archives").doc(archive.id).set(archive).catch((err: any) =>
+              console.error("[ARCHIVES] Background sync of archive failed:", err)
+            );
+          }
+        }
+      } catch (error) {
+        console.error("[ARCHIVES] Error reading local archives file:", error);
+      }
+    }
+
+    // Sort descending by date
+    userArchives.sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime());
     res.json(userArchives);
   } catch (error) {
+    console.error("Error getting archives:", error);
     res.status(500).json({ error: "Failed to read archives" });
   }
 });
 
-app.post("/api/archives", authenticateUser, (req: any, res) => {
+app.post("/api/archives", authenticateUser, async (req: any, res) => {
   try {
     const uid = req.user.uid;
     const { id, name, date, framework, encryptedContent, encryptedNotes } = req.body;
@@ -421,90 +533,296 @@ app.post("/api/archives", authenticateUser, (req: any, res) => {
       return res.status(400).json({ error: "Missing archive details" });
     }
 
-    const currentData = JSON.parse(fs.readFileSync(ARCHIVES_FILE, "utf-8"));
-    let db: Record<string, any[]> = {};
-    if (Array.isArray(currentData)) {
-      // Discard legacy structure and rewrite immediately to protect data privacy
-      db = {};
-      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
-    } else {
-      db = currentData;
-    }
-
-    const userArchives = db[uid] || [];
     const newArchive = { id, name, date, framework, encryptedContent, encryptedNotes };
-    
-    // Check if updating
-    const existingIndex = userArchives.findIndex((item: any) => item.id === id);
-    if (existingIndex >= 0) {
-      userArchives[existingIndex] = newArchive;
-    } else {
-      userArchives.unshift(newArchive);
+
+    // 1. Save to Firestore
+    if (adminDb) {
+      try {
+        await adminDb.collection("therapists").doc(uid).collection("archives").doc(id).set(newArchive);
+      } catch (err) {
+        console.error("[ARCHIVES] Error saving archive to Firestore:", err);
+      }
     }
 
-    db[uid] = userArchives;
-    fs.writeFileSync(ARCHIVES_FILE, JSON.stringify(db, null, 2));
+    // 2. Save to local fallback file
+    try {
+      const currentData = JSON.parse(fs.readFileSync(ARCHIVES_FILE, "utf-8"));
+      let db: Record<string, any[]> = {};
+      if (Array.isArray(currentData)) {
+        db = {};
+        fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
+      } else {
+        db = currentData;
+      }
+
+      const userArchives = db[uid] || [];
+      const existingIndex = userArchives.findIndex((item: any) => item.id === id);
+      if (existingIndex >= 0) {
+        userArchives[existingIndex] = newArchive;
+      } else {
+        userArchives.unshift(newArchive);
+      }
+
+      db[uid] = userArchives;
+      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify(db, null, 2));
+    } catch (err) {
+      console.error("[ARCHIVES] Error saving archive to local file:", err);
+    }
+
     res.json({ success: true, archive: newArchive });
   } catch (error) {
+    console.error("Error saving archive:", error);
     res.status(500).json({ error: "Failed to save archive" });
   }
 });
 
-app.delete("/api/archives/:id", authenticateUser, (req: any, res) => {
+app.delete("/api/archives/:id", authenticateUser, async (req: any, res) => {
   try {
     const uid = req.user.uid;
     const { id } = req.params;
-    const currentData = JSON.parse(fs.readFileSync(ARCHIVES_FILE, "utf-8"));
-    
-    let db: Record<string, any[]> = {};
-    if (Array.isArray(currentData)) {
-      db = {};
-      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
-    } else {
-      db = currentData;
-      if (db[uid]) {
-        db[uid] = db[uid].filter((item: any) => item.id !== id);
+
+    // 1. Delete from Firestore
+    if (adminDb) {
+      try {
+        await adminDb.collection("therapists").doc(uid).collection("archives").doc(id).delete();
+      } catch (err) {
+        console.error("[ARCHIVES] Error deleting archive from Firestore:", err);
       }
     }
-    
-    fs.writeFileSync(ARCHIVES_FILE, JSON.stringify(db, null, 2));
+
+    // 2. Delete from local file
+    try {
+      const currentData = JSON.parse(fs.readFileSync(ARCHIVES_FILE, "utf-8"));
+      let db: Record<string, any[]> = {};
+      if (Array.isArray(currentData)) {
+        db = {};
+        fs.writeFileSync(ARCHIVES_FILE, JSON.stringify({}));
+      } else {
+        db = currentData;
+        if (db[uid]) {
+          db[uid] = db[uid].filter((item: any) => item.id !== id);
+        }
+      }
+      fs.writeFileSync(ARCHIVES_FILE, JSON.stringify(db, null, 2));
+    } catch (err) {
+      console.error("[ARCHIVES] Error deleting archive from local file:", err);
+    }
+
     res.json({ success: true });
   } catch (error) {
+    console.error("Error deleting archive:", error);
     res.status(500).json({ error: "Failed to delete archive" });
   }
 });
 
 // 4. Therapist Settings APIs (per-therapist custom directives persistence - scoped by verified uid)
-app.get("/api/settings", authenticateUser, (req: any, res) => {
+app.get("/api/settings", authenticateUser, async (req: any, res) => {
   try {
     const uid = req.user.uid;
-    const currentSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
-    const therapistSettings = currentSettings[uid] || null;
+    let therapistSettings = null;
+
+    // 1. Try Firestore first
+    if (adminDb) {
+      try {
+        const docSnap = await adminDb.collection("therapists").doc(uid).collection("settings").doc("directives").get();
+        if (docSnap.exists) {
+          therapistSettings = docSnap.data();
+        }
+      } catch (err) {
+        console.error("[SETTINGS] Error reading settings from Firestore:", err);
+      }
+    }
+
+    // 2. Try local backup file
+    if (!therapistSettings) {
+      try {
+        const currentSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+        therapistSettings = currentSettings[uid] || null;
+
+        // Sync back to Firestore in background if active
+        if (therapistSettings && adminDb) {
+          adminDb.collection("therapists").doc(uid).collection("settings").doc("directives").set(therapistSettings).catch((err: any) =>
+            console.error("[SETTINGS] Background sync to Firestore failed:", err)
+          );
+        }
+      } catch (e) {}
+    }
+
     res.json(therapistSettings);
   } catch (error) {
+    console.error("Error reading settings:", error);
     res.status(500).json({ error: "Failed to read settings" });
   }
 });
 
-app.post("/api/settings", authenticateUser, (req: any, res) => {
+app.post("/api/settings", authenticateUser, async (req: any, res) => {
   try {
     const uid = req.user.uid;
     const { styleInstructions, activeTemplateName, customTemplates, therapistName, therapistTitle, encryptedSentinel } = req.body;
-    const currentSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
     
-    currentSettings[uid] = { 
-      styleInstructions, 
-      activeTemplateName, 
-      customTemplates, 
-      therapistName, 
-      therapistTitle,
-      encryptedSentinel
+    const settingsData = { 
+      styleInstructions: styleInstructions || "", 
+      activeTemplateName: activeTemplateName || "", 
+      customTemplates: customTemplates || [], 
+      therapistName: therapistName || "", 
+      therapistTitle: therapistTitle || "",
+      encryptedSentinel: encryptedSentinel || ""
     };
-    
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
-    res.json({ success: true, settings: currentSettings[uid] });
+
+    // 1. Save to Firestore
+    if (adminDb) {
+      try {
+        await adminDb.collection("therapists").doc(uid).collection("settings").doc("directives").set(settingsData);
+      } catch (err) {
+        console.error("[SETTINGS] Error saving settings to Firestore:", err);
+      }
+    }
+
+    // 2. Always write to local fallback SETTINGS_FILE
+    try {
+      const currentSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+      currentSettings[uid] = settingsData;
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(currentSettings, null, 2));
+    } catch (err) {
+      console.error("[SETTINGS] Error saving settings to local file:", err);
+    }
+
+    res.json({ success: true, settings: settingsData });
   } catch (error) {
+    console.error("Error saving settings:", error);
     res.status(500).json({ error: "Failed to save settings" });
+  }
+});
+
+// 5. Local Secure Workstation Authentication APIs
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { email, password, displayName } = req.body;
+    if (!email || !password || !displayName) {
+      return res.status(400).json({ error: "Missing required registration fields" });
+    }
+
+    const normEmail = email.trim().toLowerCase();
+    const uid = `local-u-${Math.random().toString(36).substring(2, 11)}`;
+    const newUser = {
+      uid,
+      email: normEmail,
+      displayName: displayName.trim(),
+      password,
+    };
+
+    // Check if user already exists
+    let userExists = false;
+
+    // 1. Check in Firestore
+    if (adminDb) {
+      try {
+        const querySnapshot = await adminDb.collection("workstationUsers")
+          .where("email", "==", normEmail)
+          .limit(1)
+          .get();
+        if (!querySnapshot.empty) {
+          userExists = true;
+        }
+      } catch (err) {
+        console.error("[AUTH] Firestore register check failed:", err);
+      }
+    }
+
+    // 2. Fallback check in local files
+    if (!userExists) {
+      try {
+        const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+        if (users[normEmail]) {
+          userExists = true;
+        }
+      } catch (e) {}
+    }
+
+    if (userExists) {
+      return res.status(400).json({ error: "An account with this email address is already registered on this workstation." });
+    }
+
+    // Save to Firestore
+    if (adminDb) {
+      try {
+        await adminDb.collection("workstationUsers").doc(uid).set(newUser);
+      } catch (err) {
+        console.error("[AUTH] Firestore registration save failed:", err);
+      }
+    }
+
+    // Always save to USERS_FILE as secondary / fallback
+    try {
+      const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+      users[normEmail] = newUser;
+      fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+    } catch (err) {
+      console.error("[AUTH] Local file registration save failed:", err);
+    }
+
+    res.json({
+      uid,
+      email: normEmail,
+      displayName: newUser.displayName,
+    });
+  } catch (error) {
+    console.error("Register error:", error);
+    res.status(500).json({ error: "Failed to register local clinician account" });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "Missing email or password" });
+    }
+
+    const normEmail = email.trim().toLowerCase();
+    let foundUser: any = null;
+
+    // 1. Try Firestore
+    if (adminDb) {
+      try {
+        const querySnapshot = await adminDb.collection("workstationUsers")
+          .where("email", "==", normEmail)
+          .limit(1)
+          .get();
+        if (!querySnapshot.empty) {
+          foundUser = querySnapshot.docs[0].data();
+        }
+      } catch (err) {
+        console.error("[AUTH] Firestore login failed:", err);
+      }
+    }
+
+    // 2. Fallback to local files
+    if (!foundUser) {
+      try {
+        const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+        foundUser = users[normEmail];
+        
+        // Background sync to Firestore
+        if (foundUser && adminDb) {
+          adminDb.collection("workstationUsers").doc(foundUser.uid).set(foundUser).catch((err: any) => 
+            console.error("[AUTH] Background sync on login failed:", err)
+          );
+        }
+      } catch (e) {}
+    }
+
+    if (!foundUser || foundUser.password !== password) {
+      return res.status(400).json({ error: "Invalid email or password. Please verify your workstation credentials." });
+    }
+
+    res.json({
+      uid: foundUser.uid,
+      email: foundUser.email,
+      displayName: foundUser.displayName,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to verify workstation credentials" });
   }
 });
 
