@@ -249,132 +249,139 @@ export interface ClinicalArchive {
 
 // Saves a clinical archive to either Firestore or Fallback Local Database
 export async function saveClinicalArchive(userUid: string, archive: ClinicalArchive): Promise<void> {
-  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
-    const userDocRef = doc(db, "therapists", userUid, "archives", archive.id);
-    await setDoc(userDocRef, archive);
-  } else {
-    // Sync with localStorage
-    try {
-      const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`) || "[]";
-      const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
-      const filtered = localArchives.filter(a => a.id !== archive.id);
-      localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify([...filtered, archive]));
-    } catch (e) {
-      console.error("Local storage sync error:", e);
-    }
+  // 1. Sync with localStorage for immediate local cache
+  try {
+    const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`) || "[]";
+    const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
+    const filtered = localArchives.filter(a => a.id !== archive.id);
+    localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify([...filtered, archive]));
+  } catch (e) {
+    console.error("Local storage sync error:", e);
+  }
 
-    // Call server local database endpoint with Auth header
-    const headers = await getAuthHeaders(userUid);
-    const response = await fetch("/api/archives", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(archive),
-    });
-    if (!response.ok) {
-      throw new Error("Failed to save to secure local database");
+  // 2. Client Firestore write if available
+  if (isFirebaseEnabled && db && auth?.currentUser) {
+    try {
+      const userDocRef = doc(db, "therapists", userUid, "archives", archive.id);
+      await setDoc(userDocRef, archive);
+    } catch (e) {
+      console.warn("Client Firestore archive save failed, relying on server route:", e);
     }
+  }
+
+  // 3. Call server database endpoint
+  const headers = await getAuthHeaders(userUid);
+  const response = await fetch("/api/archives", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(archive),
+  });
+  if (!response.ok) {
+    throw new Error("Failed to save clinical archive");
   }
 }
 
 // Retrieves all clinical archives for a therapist
 export async function getClinicalArchives(userUid: string): Promise<ClinicalArchive[]> {
-  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
-    const colRef = collection(db, "therapists", userUid, "archives");
-    const snapshot = await getDocs(colRef);
-    const archives: ClinicalArchive[] = [];
-    snapshot.forEach((doc) => {
-      archives.push(doc.data() as ClinicalArchive);
-    });
-    // Sort descending by date
-    return archives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-  } else {
-    // Try localStorage first
-    let hasLocal = false;
-    try {
-      const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
-      if (localArchivesStr) {
-        const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
-        if (localArchives.length > 0) {
-          hasLocal = true;
-        }
-      }
-    } catch (e) {}
+  let archives: ClinicalArchive[] = [];
 
-    // Securely migrate test archives from anonymous sandbox sessions if this account has none
-    if (!hasLocal && userUid !== "sandbox-therapist-101") {
-      const legacyKeys = ["sandbox_archives", "sandbox_archives_sandbox-therapist-101"];
-      for (const legacyKey of legacyKeys) {
-        const oldArchivesStr = localStorage.getItem(legacyKey);
-        if (oldArchivesStr) {
-          try {
-            const oldArchives: ClinicalArchive[] = JSON.parse(oldArchivesStr);
-            if (Array.isArray(oldArchives) && oldArchives.length > 0) {
-              localStorage.setItem(`sandbox_archives_${userUid}`, oldArchivesStr);
-              // Sync up migrated archives with server in background
-              for (const arch of oldArchives) {
-                saveClinicalArchive(userUid, arch).catch((err) => 
-                  console.error("Background migration upload failed for archive:", err)
-                );
-              }
-              console.log(`Successfully migrated ${oldArchives.length} archives from legacy key "${legacyKey}" to user "${userUid}"`);
-              break;
-            }
-          } catch (e) {
-            console.warn("Legacy archives migration failed:", e);
-          }
-        }
-      }
-    }
-
-    try {
-      const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
-      if (localArchivesStr) {
-        const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
-        if (localArchives.length > 0) {
-          return localArchives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
-        }
-      }
-    } catch (e) {}
-
-    // Fetch from server local database endpoint with Auth header
+  // 1. Try server endpoint first (server queries Firestore via Admin SDK)
+  try {
     const headers = await getAuthHeaders(userUid);
     const response = await fetch("/api/archives", { headers });
-    if (!response.ok) {
-      throw new Error("Failed to load clinical archives");
+    if (response.ok) {
+      const data: ClinicalArchive[] = await response.json();
+      if (Array.isArray(data) && data.length > 0) {
+        localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify(data));
+        return data;
+      }
     }
-    const data: ClinicalArchive[] = await response.json();
-    if (data && data.length > 0) {
-      localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify(data));
-    }
-    return data;
+  } catch (e) {
+    console.warn("Server archives fetch error:", e);
   }
+
+  // 2. Try client Firestore if available
+  if (isFirebaseEnabled && db && auth?.currentUser) {
+    try {
+      const colRef = collection(db, "therapists", userUid, "archives");
+      const snapshot = await getDocs(colRef);
+      snapshot.forEach((doc) => {
+        archives.push(doc.data() as ClinicalArchive);
+      });
+      if (archives.length > 0) {
+        archives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify(archives));
+        return archives;
+      }
+    } catch (e) {
+      console.warn("Client Firestore getDocs failed:", e);
+    }
+  }
+
+  // 3. Try localStorage
+  try {
+    const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
+    if (localArchivesStr) {
+      const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
+      if (localArchives.length > 0) {
+        return localArchives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      }
+    }
+  } catch (e) {}
+
+  // 4. Migrate legacy keys if present
+  if (userUid !== "sandbox-therapist-101") {
+    const legacyKeys = ["sandbox_archives", "sandbox_archives_sandbox-therapist-101"];
+    for (const legacyKey of legacyKeys) {
+      const oldArchivesStr = localStorage.getItem(legacyKey);
+      if (oldArchivesStr) {
+        try {
+          const oldArchives: ClinicalArchive[] = JSON.parse(oldArchivesStr);
+          if (Array.isArray(oldArchives) && oldArchives.length > 0) {
+            localStorage.setItem(`sandbox_archives_${userUid}`, oldArchivesStr);
+            for (const arch of oldArchives) {
+              saveClinicalArchive(userUid, arch).catch((err) => 
+                console.error("Background migration upload failed for archive:", err)
+              );
+            }
+            return oldArchives.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  return [];
 }
 
 // Deletes a clinical archive
 export async function deleteClinicalArchive(userUid: string, id: string): Promise<void> {
-  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
-    const docRef = doc(db, "therapists", userUid, "archives", id);
-    await deleteDoc(docRef);
-  } else {
-    // Delete from localStorage
-    try {
-      const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
-      if (localArchivesStr) {
-        const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
-        const filtered = localArchives.filter(a => a.id !== id);
-        localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify(filtered));
-      }
-    } catch (e) {}
-
-    // Delete from server local database endpoint with Auth header
-    const headers = await getAuthHeaders(userUid);
-    const response = await fetch(`/api/archives/${id}`, {
-      method: "DELETE",
-      headers,
-    });
-    if (!response.ok) {
-      throw new Error("Failed to delete archive from local database");
+  // 1. Delete from localStorage
+  try {
+    const localArchivesStr = localStorage.getItem(`sandbox_archives_${userUid}`);
+    if (localArchivesStr) {
+      const localArchives: ClinicalArchive[] = JSON.parse(localArchivesStr);
+      const filtered = localArchives.filter(a => a.id !== id);
+      localStorage.setItem(`sandbox_archives_${userUid}`, JSON.stringify(filtered));
     }
+  } catch (e) {}
+
+  // 2. Client Firestore delete if active
+  if (isFirebaseEnabled && db && auth?.currentUser) {
+    try {
+      const docRef = doc(db, "therapists", userUid, "archives", id);
+      await deleteDoc(docRef);
+    } catch (e) {}
+  }
+
+  // 3. Delete from server endpoint
+  const headers = await getAuthHeaders(userUid);
+  const response = await fetch(`/api/archives/${id}`, {
+    method: "DELETE",
+    headers,
+  });
+  if (!response.ok) {
+    throw new Error("Failed to delete archive");
   }
 }
 
@@ -389,89 +396,97 @@ export interface TherapistSettings {
 
 // Saves custom clinical directives settings linked to user profile
 export async function saveTherapistSettings(userUid: string, settings: TherapistSettings): Promise<void> {
-  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
-    const docRef = doc(db, "therapists", userUid, "settings", "directives");
-    await setDoc(docRef, settings);
-  } else {
-    // Sync to localStorage
-    localStorage.setItem(`sandbox_settings_${userUid}`, JSON.stringify(settings));
+  // 1. Always sync to localStorage
+  localStorage.setItem(`sandbox_settings_${userUid}`, JSON.stringify(settings));
 
-    const headers = await getAuthHeaders(userUid);
-    const response = await fetch("/api/settings", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(settings),
-    });
-    if (!response.ok) {
-      throw new Error("Failed to save therapist settings to secure local database");
+  // 2. Client Firestore write if available
+  if (isFirebaseEnabled && db && auth?.currentUser) {
+    try {
+      const docRef = doc(db, "therapists", userUid, "settings", "directives");
+      await setDoc(docRef, settings);
+    } catch (e) {
+      console.warn("Client Firestore save settings failed, relying on server route:", e);
     }
+  }
+
+  // 3. Save to server endpoint (which uses Admin SDK and local storage fallback)
+  const headers = await getAuthHeaders(userUid);
+  const response = await fetch("/api/settings", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) {
+    throw new Error("Failed to save therapist settings");
   }
 }
 
 // Retrieves custom clinical directives settings linked to user profile
 export async function getTherapistSettings(userUid: string): Promise<TherapistSettings | null> {
-  if (isFirebaseEnabled && db && !userUid.startsWith("local-") && userUid !== "sandbox-therapist-101") {
+  // 1. Fetch from server endpoint first (server checks Admin Firestore)
+  try {
+    const headers = await getAuthHeaders(userUid);
+    const response = await fetch("/api/settings", { headers });
+    if (response.ok) {
+      const data = await response.json();
+      if (data && (data.styleInstructions || data.activeTemplateName || data.customTemplates?.length > 0 || data.therapistName || data.encryptedSentinel)) {
+        localStorage.setItem(`sandbox_settings_${userUid}`, JSON.stringify(data));
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn("Server /api/settings fetch error:", e);
+  }
+
+  // 2. Client Firestore read if active
+  if (isFirebaseEnabled && db && auth?.currentUser) {
     try {
       const docRef = doc(db, "therapists", userUid, "settings", "directives");
       const docSnap = await getDoc(docRef);
       if (docSnap.exists()) {
-        return docSnap.data() as TherapistSettings;
-      }
-    } catch (e) {
-      console.error("Error retrieving settings from Firestore:", e);
-      throw new Error(`Failed to load settings from cloud store: ${(e as Error).message || "Transient Network Error"}`);
-    }
-    return null;
-  } else {
-    // Try localStorage first
-    let localBackup = localStorage.getItem(`sandbox_settings_${userUid}`);
-
-    // If no user-specific settings exist, look for legacy anonymous sandbox settings to migrate!
-    if (!localBackup && userUid !== "sandbox-therapist-101") {
-      const legacyKeys = ["sandbox_settings", "sandbox_settings_sandbox-therapist-101"];
-      for (const legacyKey of legacyKeys) {
-        const oldData = localStorage.getItem(legacyKey);
-        if (oldData) {
-          try {
-            const parsed = JSON.parse(oldData);
-            if (parsed && (parsed.styleInstructions || parsed.customTemplates?.length > 0)) {
-              localBackup = oldData;
-              // Save to current user locally so it exists immediately
-              localStorage.setItem(`sandbox_settings_${userUid}`, oldData);
-              // Save to current user on the workstation server in background
-              saveTherapistSettings(userUid, parsed).catch((err) => 
-                console.error("Background migration upload failed for settings:", err)
-              );
-              console.log(`Successfully migrated settings from legacy key "${legacyKey}" to user "${userUid}"`);
-              break;
-            }
-          } catch (e) {
-            console.warn("Legacy settings migration failed:", e);
-          }
-        }
-      }
-    }
-
-    if (localBackup) {
-      try {
-        return JSON.parse(localBackup);
-      } catch (e) {}
-    }
-
-    try {
-      const headers = await getAuthHeaders(userUid);
-      const response = await fetch("/api/settings", { headers });
-      if (!response.ok) {
-        throw new Error(`Server returned status ${response.status}`);
-      }
-      const data = await response.json();
-      if (data) {
+        const data = docSnap.data() as TherapistSettings;
         localStorage.setItem(`sandbox_settings_${userUid}`, JSON.stringify(data));
+        return data;
       }
-      return data;
     } catch (e) {
-      console.error("Error retrieving settings from fallback server:", e);
-      throw new Error(`Failed to load settings from secure storage: ${(e as Error).message || "Transient Connection Error"}`);
+      console.warn("Client Firestore getDoc failed:", e);
     }
   }
+
+  // 3. Local storage fallback
+  const localBackup = localStorage.getItem(`sandbox_settings_${userUid}`);
+  if (localBackup) {
+    try {
+      const parsed = JSON.parse(localBackup);
+      if (parsed) {
+        // Sync to server in background if server didn't have it
+        saveTherapistSettings(userUid, parsed).catch((err) =>
+          console.error("Background settings sync to server failed:", err)
+        );
+        return parsed;
+      }
+    } catch (e) {}
+  }
+
+  // 4. Legacy migration fallback
+  if (userUid !== "sandbox-therapist-101") {
+    const legacyKeys = ["sandbox_settings", "sandbox_settings_sandbox-therapist-101"];
+    for (const legacyKey of legacyKeys) {
+      const oldData = localStorage.getItem(legacyKey);
+      if (oldData) {
+        try {
+          const parsed = JSON.parse(oldData);
+          if (parsed && (parsed.styleInstructions || parsed.customTemplates?.length > 0)) {
+            localStorage.setItem(`sandbox_settings_${userUid}`, oldData);
+            saveTherapistSettings(userUid, parsed).catch((err) => 
+              console.error("Background migration upload failed for settings:", err)
+            );
+            return parsed;
+          }
+        } catch (e) {}
+      }
+    }
+  }
+
+  return null;
 }
