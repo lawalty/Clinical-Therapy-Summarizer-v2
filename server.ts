@@ -1,7 +1,6 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import crypto from "node:crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import dotenv from "dotenv";
@@ -9,7 +8,7 @@ import dotenv from "dotenv";
 import mammoth from "mammoth";
 import { initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore as getAdminFirestore } from "firebase-admin/firestore";
+import { FieldValue, getFirestore as getAdminFirestore } from "firebase-admin/firestore";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import proxy from "express-http-proxy";
@@ -117,9 +116,6 @@ async function safeFirestoreOperation(op: () => Promise<any>): Promise<any> {
   }
 }
 
-// In-memory local user cache for resilient auth across requests
-const activeUserMap = new Map<string, { uid: string; email: string; displayName: string }>();
-
 // Authentication Middleware (Finding A)
 const authenticateUser = async (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
@@ -129,57 +125,10 @@ const authenticateUser = async (req: any, res: any, next: any) => {
 
   const token = authHeader.split("Bearer ")[1];
   
-  // Restrict sandbox token to the specific known client-side sandbox identifier
-  // or local secure tokens generated during registration/login
-  if (token === "sandbox-therapist-101" || token.startsWith("local-")) {
-    let email = "sandbox@example.com";
-    let userFound = false;
-
-    if (token === "sandbox-therapist-101") {
-      email = "sandbox@example.com";
-      userFound = true;
-    } else if (activeUserMap.has(token)) {
-      const u = activeUserMap.get(token)!;
-      email = u.email;
-      userFound = true;
-    } else {
-      // 1. Check Firestore safely
-      const userDoc = await safeFirestoreOperation(() => adminDb.collection("workstationUsers").doc(token).get());
-      if (userDoc && userDoc.exists) {
-        const userData = userDoc.data();
-        email = userData.email;
-        userFound = true;
-        activeUserMap.set(token, { uid: token, email, displayName: userData.displayName || "" });
-      } else {
-        // 2. Fallback to local files
-        try {
-          if (fs.existsSync(USERS_FILE)) {
-            const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-            const user = Object.values(users).find((u: any) => u.uid === token) as any;
-            if (user) {
-              email = user.email;
-              userFound = true;
-              activeUserMap.set(token, { uid: token, email: user.email, displayName: user.displayName || "" });
-            }
-          }
-        } catch (e) {
-          console.error("[AUTH] Local user store read error:", e);
-        }
-      }
-
-      // 3. Resilient fallback for local- format token
-      if (!userFound && token.startsWith("local-")) {
-        email = "therapist@workstation.local";
-        userFound = true;
-        activeUserMap.set(token, { uid: token, email, displayName: "Licensed Therapist" });
-      }
-    }
-
-    if (!userFound) {
-      return res.status(401).json({ error: "Local therapist profile not found or expired. Please sign in again." });
-    }
-
-    req.user = { uid: token, email: email };
+  // The fixed sandbox identity is available only during local development.
+  // Production clinical data routes require a verified Firebase ID token.
+  if (token === "sandbox-therapist-101" && process.env.NODE_ENV !== "production") {
+    req.user = { uid: token, email: "sandbox@example.com" };
     return next();
   }
 
@@ -212,6 +161,15 @@ const expensiveApiLimiter = rateLimit({
     return req.user?.uid || req.ip || "unknown-ip";
   },
   message: { error: "Too many clinical synthesis requests. Please try again in 15 minutes." }
+});
+
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: false,
+  message: { error: "Too many password recovery attempts. Please wait 15 minutes and try again." }
 });
 
 // Initialize Gemini client safely
@@ -700,149 +658,118 @@ app.post("/api/settings", authenticateUser, async (req: any, res) => {
   }
 });
 
-// Helper to generate deterministic UIDs from email addresses so accounts are resilient across instances
-function getDeterministicUid(email: string): string {
-  const normEmail = email.trim().toLowerCase();
-  const hash = crypto.createHash("sha256").update(normEmail).digest("hex").substring(0, 16);
-  return `local-u-${hash}`;
+// 5. Firebase Authentication recovery and profile APIs
+const normalizeEmail = (value: unknown): string => String(value || "").trim().toLowerCase();
+const isEmailAddress = (value: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+
+function readLegacyLocalUser(email: string): any | null {
+  try {
+    const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+    return users[email] || Object.values(users).find((user: any) => normalizeEmail(user?.email) === email) || null;
+  } catch (error) {
+    console.warn("[AUTH] Unable to inspect the legacy local user file.");
+    return null;
+  }
 }
 
-// 5. Local Secure Workstation Authentication APIs
-app.post("/api/auth/register", async (req, res) => {
+function removeLegacyLocalPassword(email: string, uid: string): void {
   try {
-    const { email, password, displayName } = req.body;
-    if (!email || !password || !displayName) {
-      return res.status(400).json({ error: "Missing required registration fields" });
-    }
-
-    const normEmail = email.trim().toLowerCase();
-    const uid = getDeterministicUid(normEmail);
-    const newUser = {
-      uid,
-      email: normEmail,
-      displayName: displayName.trim(),
-      password,
-    };
-
-    // Check if user already exists
-    let userExists = false;
-
-    // 1. Check in Firestore safely
-    const docSnap = await safeFirestoreOperation(() => adminDb.collection("workstationUsers").doc(uid).get());
-    if (docSnap && docSnap.exists) {
-      userExists = true;
-    } else {
-      const querySnapshot = await safeFirestoreOperation(() => 
-        adminDb.collection("workstationUsers").where("email", "==", normEmail).limit(1).get()
-      );
-      if (querySnapshot && !querySnapshot.empty) {
-        userExists = true;
+    const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
+    let changed = false;
+    for (const user of Object.values(users) as any[]) {
+      if ((normalizeEmail(user?.email) === email || user?.uid === uid) && Object.hasOwn(user, "password")) {
+        delete user.password;
+        user.authProvider = "firebase";
+        changed = true;
       }
     }
-
-    // 2. Fallback check in local files
-    if (!userExists) {
-      try {
-        const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-        if (users[normEmail] || Object.values(users).some((u: any) => u.uid === uid)) {
-          userExists = true;
-        }
-      } catch (e) {}
-    }
-
-    if (userExists) {
-      return res.status(400).json({ error: "An account with this email address is already registered on this workstation." });
-    }
-
-    // Cache in memory immediately
-    activeUserMap.set(uid, newUser);
-
-    // Save to Firestore safely
-    safeFirestoreOperation(() => adminDb.collection("workstationUsers").doc(uid).set(newUser));
-
-    // Always save to USERS_FILE as secondary / fallback
-    try {
-      const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-      users[normEmail] = newUser;
+    if (changed) {
       fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-    } catch (err) {
-      console.error("[AUTH] Local file registration save failed:", err);
+    }
+  } catch (error) {
+    console.warn("[AUTH] Unable to scrub a legacy local password.");
+  }
+}
+
+app.post("/api/auth/password-reset/prepare", passwordResetLimiter, async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  if (!isEmailAddress(email)) {
+    return res.status(400).json({ error: "Enter a valid clinical email address." });
+  }
+  if (!firebaseAdminInitialized || !adminDb) {
+    return res.status(503).json({ error: "Password recovery is temporarily unavailable. Please contact the administrator." });
+  }
+
+  try {
+    const legacyQuery = await adminDb.collection("workstationUsers").where("email", "==", email).limit(1).get();
+    const legacyDoc = legacyQuery.empty ? null : legacyQuery.docs[0];
+    const legacyData = legacyDoc?.data() || readLegacyLocalUser(email);
+    const legacyUid = String(legacyData?.uid || legacyDoc?.id || "");
+
+    let authUser: any = null;
+    try {
+      authUser = await getAuth().getUserByEmail(email);
+    } catch (error: any) {
+      if (error?.code !== "auth/user-not-found") throw error;
     }
 
-    res.json({
-      uid,
-      email: normEmail,
-      displayName: newUser.displayName,
-    });
-  } catch (error) {
-    console.error("Register error:", error);
-    res.status(500).json({ error: "Failed to register local clinician account" });
+    if (!authUser && legacyData && legacyUid) {
+      authUser = await getAuth().createUser({
+        uid: legacyUid,
+        email,
+        displayName: String(legacyData.displayName || "Licensed Therapist").slice(0, 128),
+        disabled: false,
+      });
+      console.log(`[AUTH] Migrated legacy clinician identity ${legacyUid} to Firebase Authentication.`);
+    }
+
+    if (legacyDoc) {
+      await legacyDoc.ref.set({
+        authProvider: "firebase",
+        authMigratedAt: FieldValue.serverTimestamp(),
+        password: FieldValue.delete(),
+      }, { merge: true });
+    }
+    if (authUser) {
+      removeLegacyLocalPassword(email, authUser.uid);
+    }
+
+    // This response intentionally does not reveal whether the account exists.
+    return res.json({ accepted: true });
+  } catch (error: any) {
+    console.error("[AUTH] Password recovery preparation failed:", error?.message || error);
+    return res.status(503).json({ error: "Password recovery is temporarily unavailable. Please try again later." });
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: "Missing email or password" });
-    }
-
-    const normEmail = email.trim().toLowerCase();
-    const deterministicUid = getDeterministicUid(normEmail);
-    let foundUser: any = null;
-
-    // 1. Try Firestore safely
-    const docSnap = await safeFirestoreOperation(() => adminDb.collection("workstationUsers").doc(deterministicUid).get());
-    if (docSnap && docSnap.exists) {
-      foundUser = docSnap.data();
-    } else {
-      const querySnapshot = await safeFirestoreOperation(() => 
-        adminDb.collection("workstationUsers").where("email", "==", normEmail).limit(1).get()
-      );
-      if (querySnapshot && !querySnapshot.empty) {
-        foundUser = querySnapshot.docs[0].data();
-      }
-    }
-
-    // 2. Fallback to local files
-    if (!foundUser) {
-      try {
-        const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-        foundUser = users[normEmail] || Object.values(users).find((u: any) => u.uid === deterministicUid);
-      } catch (e) {}
-    }
-
-    // 3. Auto-recovery if instance restarted and wiped ephemeral file before initial sync
-    if (!foundUser) {
-      foundUser = {
-        uid: deterministicUid,
-        email: normEmail,
-        displayName: normEmail.split("@")[0],
-        password: password
-      };
-
-      // Auto-provision user record safely
-      safeFirestoreOperation(() => adminDb.collection("workstationUsers").doc(deterministicUid).set(foundUser));
-      try {
-        const users = JSON.parse(fs.readFileSync(USERS_FILE, "utf-8"));
-        users[normEmail] = foundUser;
-        fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-      } catch (e) {}
-    } else if (foundUser.password !== password) {
-      return res.status(400).json({ error: "Invalid password. Please verify your workstation credentials." });
-    }
-
-    // Cache user in memory
-    activeUserMap.set(foundUser.uid, foundUser);
-
-    res.json({
-      uid: foundUser.uid,
-      email: foundUser.email,
-      displayName: foundUser.displayName,
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to verify workstation credentials" });
+app.post("/api/auth/profile", authenticateUser, async (req: any, res) => {
+  if (!adminDb) {
+    return res.status(503).json({ error: "The clinician profile service is temporarily unavailable." });
   }
+
+  try {
+    const uid = String(req.user.uid);
+    const email = normalizeEmail(req.user.email);
+    const displayName = String(req.body?.displayName || req.user.name || "Licensed Therapist").trim().slice(0, 128);
+    await adminDb.collection("workstationUsers").doc(uid).set({
+      uid,
+      email,
+      displayName,
+      authProvider: "firebase",
+      updatedAt: FieldValue.serverTimestamp(),
+      password: FieldValue.delete(),
+    }, { merge: true });
+    removeLegacyLocalPassword(email, uid);
+    return res.json({ success: true });
+  } catch (error: any) {
+    console.error("[AUTH] Profile synchronization failed:", error?.message || error);
+    return res.status(500).json({ error: "Failed to synchronize clinician profile." });
+  }
+});
+
+// Stale clients must not fall back to the former plaintext-password endpoints.
+app.post(["/api/auth/register", "/api/auth/login"], (_req, res) => {
+  return res.status(410).json({ error: "This authentication method has been retired. Refresh the application and use secure sign-in." });
 });
 
 // ------------------- VITE ASSET SERVING -------------------

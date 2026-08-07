@@ -12,6 +12,7 @@ import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
   updateProfile,
   User as FirebaseUser
 } from "firebase/auth";
@@ -92,9 +93,9 @@ export async function getAuthHeaders(userUid?: string): Promise<Record<string, s
     } catch (err) {
       console.error("Error fetching Firebase ID token:", err);
     }
-  } else if (userUid) {
+  } else if (!isFirebaseEnabled && userUid) {
     headers["Authorization"] = `Bearer ${userUid}`;
-  } else {
+  } else if (!isFirebaseEnabled) {
     const stored = localStorage.getItem("sandbox_user");
     if (stored) {
       try {
@@ -113,12 +114,14 @@ export async function getAuthHeaders(userUid?: string): Promise<Record<string, s
 export async function loginWithGoogle(): Promise<TherapistUser> {
   if (isFirebaseEnabled && auth) {
     const result = await signInWithPopup(auth, provider);
-    return {
+    const therapistUser = {
       uid: result.user.uid,
       email: result.user.email || "",
       displayName: result.user.displayName || "Licensed Therapist",
       photoURL: result.user.photoURL || undefined,
     };
+    await syncAuthenticatedProfile(result.user);
+    return therapistUser;
   } else {
     // Return standard sandbox clinician account with clean placeholders
     const sandboxUser: TherapistUser = {
@@ -132,56 +135,122 @@ export async function loginWithGoogle(): Promise<TherapistUser> {
   }
 }
 
-export async function loginWithEmail(email: string, password: string): Promise<TherapistUser> {
-  // Use our secure local workstation API endpoints to authenticate.
-  // This bypasses Firebase Auth completely for email-based login (Solution 3),
-  // preventing configuration blocks and popup domain issues inside dynamic containers.
-  const response = await fetch("/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || "Failed to authenticate workstation credentials");
+function requireFirebaseAuth() {
+  if (!isFirebaseEnabled || !auth) {
+    throw new Error("Secure account authentication is not configured. Please contact the application administrator.");
   }
-  
-  const user = await response.json();
-  const therapistUser: TherapistUser = {
-    uid: user.uid,
-    email: user.email,
-    displayName: user.displayName,
-    isSandbox: true,
-  };
-  
-  localStorage.setItem("sandbox_user", JSON.stringify(therapistUser));
-  return therapistUser;
+  return auth;
+}
+
+function getFriendlyAuthError(error: any, fallback: string): Error {
+  const code = String(error?.code || "");
+  if (code === "auth/invalid-credential" || code === "auth/wrong-password" || code === "auth/user-not-found") {
+    return new Error("The email address or password is incorrect.");
+  }
+  if (code === "auth/email-already-in-use") {
+    return new Error("An account already exists for this email address. Sign in or use Forgot password.");
+  }
+  if (code === "auth/weak-password") {
+    return new Error("Choose a stronger password with at least 6 characters.");
+  }
+  if (code === "auth/too-many-requests") {
+    return new Error("Too many attempts. Please wait a few minutes and try again.");
+  }
+  if (code === "auth/operation-not-allowed") {
+    return new Error("Email/password recovery is not enabled for this application. Please contact the administrator.");
+  }
+  if (code === "auth/network-request-failed") {
+    return new Error("The authentication service could not be reached. Check your connection and try again.");
+  }
+  return new Error(error?.message || fallback);
+}
+
+async function syncAuthenticatedProfile(user: FirebaseUser): Promise<void> {
+  const token = await user.getIdToken();
+  const response = await fetch("/api/auth/profile", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`,
+    },
+    body: JSON.stringify({ displayName: user.displayName || "Licensed Therapist" }),
+  });
+
+  if (!response.ok) {
+    console.warn("Authenticated profile synchronization failed; authentication remains active.");
+  }
+}
+
+export async function loginWithEmail(email: string, password: string): Promise<TherapistUser> {
+  try {
+    const firebaseAuth = requireFirebaseAuth();
+    const credential = await signInWithEmailAndPassword(firebaseAuth, email.trim().toLowerCase(), password);
+    await syncAuthenticatedProfile(credential.user);
+    return {
+      uid: credential.user.uid,
+      email: credential.user.email || email.trim().toLowerCase(),
+      displayName: credential.user.displayName || "Licensed Therapist",
+      photoURL: credential.user.photoURL || undefined,
+    };
+  } catch (error) {
+    throw getFriendlyAuthError(error, "Unable to sign in to the secure clinician account.");
+  }
 }
 
 export async function registerWithEmail(email: string, password: string, displayName: string): Promise<TherapistUser> {
-  // Use our secure local workstation API endpoints to register.
-  const response = await fetch("/api/auth/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password, displayName }),
-  });
-  
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new Error(data.error || "Failed to register local clinician account");
+  const normalizedEmail = email.trim().toLowerCase();
+  try {
+    // Bridge any pre-Firebase workstation account before registration so an
+    // existing clinician cannot accidentally create a second identity.
+    const prepareResponse = await fetch("/api/auth/password-reset/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: normalizedEmail }),
+    });
+    if (!prepareResponse.ok) {
+      const payload = await prepareResponse.json().catch(() => ({}));
+      throw new Error(payload.error || "Unable to verify whether this clinician account already exists.");
+    }
+
+    const firebaseAuth = requireFirebaseAuth();
+    const credential = await createUserWithEmailAndPassword(firebaseAuth, normalizedEmail, password);
+    await updateProfile(credential.user, { displayName: displayName.trim() });
+    await syncAuthenticatedProfile(credential.user);
+    return {
+      uid: credential.user.uid,
+      email: credential.user.email || normalizedEmail,
+      displayName: displayName.trim(),
+      photoURL: credential.user.photoURL || undefined,
+    };
+  } catch (error) {
+    throw getFriendlyAuthError(error, "Unable to register the secure clinician account.");
   }
-  
-  const user = await response.json();
-  const therapistUser: TherapistUser = {
-    uid: user.uid,
-    email: user.email,
-    displayName: user.displayName,
-    isSandbox: true,
-  };
-  
-  localStorage.setItem("sandbox_user", JSON.stringify(therapistUser));
-  return therapistUser;
+}
+
+export async function requestPasswordReset(email: string): Promise<void> {
+  const normalizedEmail = email.trim().toLowerCase();
+  try {
+    const prepareResponse = await fetch("/api/auth/password-reset/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: normalizedEmail }),
+    });
+
+    if (!prepareResponse.ok) {
+      const payload = await prepareResponse.json().catch(() => ({}));
+      throw new Error(payload.error || "Password recovery is temporarily unavailable.");
+    }
+
+    const firebaseAuth = requireFirebaseAuth();
+    await sendPasswordResetEmail(firebaseAuth, normalizedEmail, {
+      url: `${window.location.origin}/`,
+    });
+  } catch (error) {
+    // Keep the response indistinguishable when email-enumeration protection is
+    // not enabled on an older Firebase project.
+    if (String((error as any)?.code || "") === "auth/user-not-found") return;
+    throw getFriendlyAuthError(error, "Unable to send the password recovery email.");
+  }
 }
 
 export async function logoutUser(): Promise<void> {
@@ -206,17 +275,7 @@ export function subscribeToAuthChanges(callback: (user: TherapistUser | null) =>
           photoURL: user.photoURL || undefined,
         });
       } else {
-        // Fall back to check if there is a logged-in local workstation user
-        const stored = localStorage.getItem("sandbox_user");
-        if (stored) {
-          try {
-            callback(JSON.parse(stored));
-          } catch (e) {
-            callback(null);
-          }
-        } else {
-          callback(null);
-        }
+        callback(null);
       }
     });
   } else {
