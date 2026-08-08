@@ -1,7 +1,9 @@
 {
   "name": "Clinical Session Summarizer v2",
   "description": "A secure digital archive and clinical note assistant for licensed therapists, generating SOAP, DAP, BIRP, and GIRP summaries from documents, forms, and handwritten notes using advanced reasoning.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": [
+    "camera"
+  ],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]

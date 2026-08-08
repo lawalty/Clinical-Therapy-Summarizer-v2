@@ -22,7 +22,9 @@ import {
   Lock,
   Plus,
   X,
-  ShieldCheck
+  ShieldCheck,
+  Scan,
+  LayoutGrid
 } from "lucide-react";
 
 import { 
@@ -41,6 +43,8 @@ import {
 import { encryptText, decryptText } from "./utils/crypto";
 import { CLINICAL_TEMPLATES } from "./components/InstructionTemplates";
 import LockScreen from "./components/LockScreen";
+import AppModeSelectorModal, { AppToolMode } from "./components/AppModeSelectorModal";
+import TherapistNotesExtractor from "./components/TherapistNotesExtractor";
 import { motion, AnimatePresence } from "motion/react";
 
 // Robust client-side helper to extract the patient's name from clinical session notes
@@ -134,6 +138,10 @@ export default function App() {
   const [archives, setArchives] = useState<ClinicalArchive[]>([]);
   const [currentArchive, setCurrentArchive] = useState<ClinicalArchive | null>(null);
   const [archiveNameInput, setArchiveNameInput] = useState("");
+  
+  // App Tool Mode State (Therapist Notes Extractor vs Clinical Summary Generator)
+  const [activeToolMode, setActiveToolMode] = useState<AppToolMode>("notes-extractor");
+  const [isToolSelectorOpen, setIsToolSelectorOpen] = useState(false);
   
   // UI Loading States
   const [isExtracting, setIsExtracting] = useState(false);
@@ -408,7 +416,36 @@ export default function App() {
     setUser(authUser);
     setPasscode(secretPasscode);
     setLockScreenError(""); // Clear any auto-lock error
+    setIsToolSelectorOpen(true); // Open pop-up selector upon login/unlock!
     setSuccess("Workspace secure session initialized.");
+    setTimeout(() => setSuccess(""), 4000);
+  };
+
+  const handleSaveExtractorArchive = async (title: string, content: string, fw: string) => {
+    if (!user || !passcode) return;
+    const encryptedContent = await encryptText(content, passcode);
+    const encryptedNotes = await encryptText(content, passcode);
+    const archiveId = window.crypto.randomUUID();
+    const payload: ClinicalArchive = {
+      id: archiveId,
+      name: title,
+      date: new Date().toISOString(),
+      framework: fw,
+      encryptedContent,
+      encryptedNotes
+    };
+    await saveClinicalArchive(user.uid, payload);
+    await loadArchives();
+  };
+
+  const handleTransferNoteToSummaryGenerator = (formattedNote: string, detectedPatientName?: string) => {
+    setVerbatimText(formattedNote);
+    if (detectedPatientName) {
+      setBasePatientName(detectedPatientName);
+      setPatientNameInput(getFormattedPatientName(detectedPatientName, patientNameFormat));
+    }
+    setActiveToolMode("summary-generator");
+    setSuccess("Transferred extracted handwritten notes to Clinical Summary Generator!");
     setTimeout(() => setSuccess(""), 4000);
   };
 
@@ -773,10 +810,43 @@ export default function App() {
             </div>
             <h1 className="text-md font-semibold tracking-tight text-slate-800 flex items-center gap-2 font-display" id="header-title">
               ClinicianFlow <span className="text-indigo-600 font-bold">AI</span>
-              <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 text-[9px] font-bold uppercase rounded border border-indigo-200">
-                Secure Browser-Based Encryption
-              </span>
             </h1>
+          </div>
+
+          {/* Header Mode Switcher Controls */}
+          <div className="hidden md:flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200" id="header-mode-switcher">
+            <button
+              type="button"
+              onClick={() => setActiveToolMode("notes-extractor")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                activeToolMode === "notes-extractor"
+                  ? "bg-teal-700 text-white shadow-2xs"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
+              }`}
+            >
+              <Scan className="w-3.5 h-3.5" />
+              <span>1. Therapist Notes Extractor</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveToolMode("summary-generator")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                activeToolMode === "summary-generator"
+                  ? "bg-indigo-700 text-white shadow-2xs"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-200/60"
+              }`}
+            >
+              <ClipboardCheck className="w-3.5 h-3.5" />
+              <span>2. Summary Generator</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsToolSelectorOpen(true)}
+              className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200 rounded-lg transition-colors ml-1 cursor-pointer"
+              title="Open Tool Selector Pop-up"
+            >
+              <LayoutGrid className="w-3.5 h-3.5" />
+            </button>
           </div>
 
           <div className="flex items-center space-x-6" id="header-user-group">
@@ -874,8 +944,20 @@ export default function App() {
       {/* ------------------- MAIN WORKING WINDOW ------------------- */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-6 py-6 flex flex-col gap-6" id="app-workspace-main">
         
-        {/* Grid: 3 columns for inputs */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch" id="workspace-grid">
+        {/* MODE 1: Therapist Notes Extractor */}
+        {activeToolMode === "notes-extractor" && (
+          <TherapistNotesExtractor
+            user={user}
+            therapistName={therapistName || `Dr. ${(user.displayName || user.email.split("@")[0])}`}
+            onSendToSummaryGenerator={handleTransferNoteToSummaryGenerator}
+            onSaveArchive={handleSaveExtractorArchive}
+          />
+        )}
+
+        {/* MODE 2: Clinical Summary Notes Generator */}
+        {activeToolMode === "summary-generator" && (
+          <>
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch" id="workspace-grid">
           
           {/* ================= LEFT COLUMN: DOCUMENTS & REPOSITORY ================= */}
           <div className="lg:col-span-4 flex flex-col gap-6" id="left-column">
@@ -1525,8 +1607,9 @@ export default function App() {
             </div>
 
           </div>
-
         </div>
+      </>
+      )}
 
       </main>
 
@@ -1838,6 +1921,17 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ------------------- APP MODE SELECTOR MODAL ------------------- */}
+      <AppModeSelectorModal
+        isOpen={isToolSelectorOpen}
+        onClose={() => setIsToolSelectorOpen(false)}
+        onSelectMode={(mode) => {
+          setActiveToolMode(mode);
+          setIsToolSelectorOpen(false);
+        }}
+        currentMode={activeToolMode}
+      />
 
     </div>
   );

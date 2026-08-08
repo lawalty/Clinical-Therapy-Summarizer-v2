@@ -445,18 +445,32 @@ export default function LockScreen({ onUnlock, currentUser, initialError }: Lock
 
           <div className="text-center pt-2 border-t border-slate-100 flex flex-col gap-3" id="email-toggle-mode">
             {emailMode === "reset" ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setEmailMode("login");
-                  setError("");
-                  setSuccess("");
-                }}
-                className="text-xs text-indigo-600 hover:text-indigo-700 font-bold transition-colors"
-                id="back-to-login-button"
-              >
-                Back to secure sign in
-              </button>
+              <div className="flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmailMode("login");
+                    setError("");
+                    setSuccess("");
+                  }}
+                  className="text-xs text-indigo-600 hover:text-indigo-700 font-bold transition-colors cursor-pointer"
+                  id="back-to-login-button"
+                >
+                  Back to secure sign in
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmailMode("register");
+                    setError("");
+                    setSuccess("");
+                  }}
+                  className="text-xs text-slate-500 hover:text-slate-800 font-medium transition-colors cursor-pointer"
+                  id="reset-to-register-button"
+                >
+                  New to this workstation? Register an account here
+                </button>
+              </div>
             ) : !currentUser ? (
               <button
                 type="button"

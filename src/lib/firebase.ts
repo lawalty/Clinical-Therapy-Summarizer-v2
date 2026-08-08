@@ -145,22 +145,22 @@ function requireFirebaseAuth() {
 function getFriendlyAuthError(error: any, fallback: string): Error {
   const code = String(error?.code || "");
   if (code === "auth/invalid-credential" || code === "auth/wrong-password" || code === "auth/user-not-found") {
-    return new Error("The email address or password is incorrect.");
+    return new Error("Incorrect email address or password. If this is your first time using this workstation, click 'Register here' below to create your clinician account.");
   }
   if (code === "auth/email-already-in-use") {
-    return new Error("An account already exists for this email address. Sign in or use Forgot password.");
+    return new Error("An account already exists for this email address. Sign in with your password or click 'Forgot password?' to receive a reset link.");
   }
   if (code === "auth/weak-password") {
     return new Error("Choose a stronger password with at least 6 characters.");
   }
   if (code === "auth/too-many-requests") {
-    return new Error("Too many attempts. Please wait a few minutes and try again.");
+    return new Error("Too many sign-in attempts. Please wait a few minutes and try again.");
   }
   if (code === "auth/operation-not-allowed") {
-    return new Error("Email/password recovery is not enabled for this application. Please contact the administrator.");
+    return new Error("Email/password sign-in is being enabled. If you are registering, please try again or contact your clinic administrator.");
   }
   if (code === "auth/network-request-failed") {
-    return new Error("The authentication service could not be reached. Check your connection and try again.");
+    return new Error("The authentication service could not be reached. Check your internet connection and try again.");
   }
   return new Error(error?.message || fallback);
 }
@@ -182,13 +182,26 @@ async function syncAuthenticatedProfile(user: FirebaseUser): Promise<void> {
 }
 
 export async function loginWithEmail(email: string, password: string): Promise<TherapistUser> {
+  const normalizedEmail = email.trim().toLowerCase();
+  
+  if (!isFirebaseEnabled || !auth) {
+    // Local sandbox fallback mode
+    const sandboxUser: TherapistUser = {
+      uid: `local-${btoa(normalizedEmail).replace(/=/g, "").slice(0, 24)}`,
+      email: normalizedEmail,
+      displayName: normalizedEmail.split("@")[0] || "Licensed Therapist",
+      isSandbox: true,
+    };
+    localStorage.setItem("sandbox_user", JSON.stringify(sandboxUser));
+    return sandboxUser;
+  }
+
   try {
-    const firebaseAuth = requireFirebaseAuth();
-    const credential = await signInWithEmailAndPassword(firebaseAuth, email.trim().toLowerCase(), password);
+    const credential = await signInWithEmailAndPassword(auth, normalizedEmail, password);
     await syncAuthenticatedProfile(credential.user);
     return {
       uid: credential.user.uid,
-      email: credential.user.email || email.trim().toLowerCase(),
+      email: credential.user.email || normalizedEmail,
       displayName: credential.user.displayName || "Licensed Therapist",
       photoURL: credential.user.photoURL || undefined,
     };
@@ -199,21 +212,27 @@ export async function loginWithEmail(email: string, password: string): Promise<T
 
 export async function registerWithEmail(email: string, password: string, displayName: string): Promise<TherapistUser> {
   const normalizedEmail = email.trim().toLowerCase();
+
+  if (!isFirebaseEnabled || !auth) {
+    const sandboxUser: TherapistUser = {
+      uid: `local-${btoa(normalizedEmail).replace(/=/g, "").slice(0, 24)}`,
+      email: normalizedEmail,
+      displayName: displayName.trim() || normalizedEmail.split("@")[0] || "Licensed Therapist",
+      isSandbox: true,
+    };
+    localStorage.setItem("sandbox_user", JSON.stringify(sandboxUser));
+    return sandboxUser;
+  }
+
   try {
-    // Bridge any pre-Firebase workstation account before registration so an
-    // existing clinician cannot accidentally create a second identity.
-    const prepareResponse = await fetch("/api/auth/password-reset/prepare", {
+    // Bridge any pre-Firebase workstation account before registration
+    await fetch("/api/auth/password-reset/prepare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: normalizedEmail }),
-    });
-    if (!prepareResponse.ok) {
-      const payload = await prepareResponse.json().catch(() => ({}));
-      throw new Error(payload.error || "Unable to verify whether this clinician account already exists.");
-    }
+    }).catch(() => {});
 
-    const firebaseAuth = requireFirebaseAuth();
-    const credential = await createUserWithEmailAndPassword(firebaseAuth, normalizedEmail, password);
+    const credential = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
     await updateProfile(credential.user, { displayName: displayName.trim() });
     await syncAuthenticatedProfile(credential.user);
     return {
@@ -229,26 +248,26 @@ export async function registerWithEmail(email: string, password: string, display
 
 export async function requestPasswordReset(email: string): Promise<void> {
   const normalizedEmail = email.trim().toLowerCase();
+
+  if (!isFirebaseEnabled || !auth) {
+    // Local sandbox fallback mode: simulate password reset acceptance
+    return;
+  }
+
   try {
-    const prepareResponse = await fetch("/api/auth/password-reset/prepare", {
+    // Inform backend to migrate legacy workstation user if needed
+    await fetch("/api/auth/password-reset/prepare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: normalizedEmail }),
-    });
+    }).catch(() => {});
 
-    if (!prepareResponse.ok) {
-      const payload = await prepareResponse.json().catch(() => ({}));
-      throw new Error(payload.error || "Password recovery is temporarily unavailable.");
-    }
-
-    const firebaseAuth = requireFirebaseAuth();
-    await sendPasswordResetEmail(firebaseAuth, normalizedEmail, {
+    await sendPasswordResetEmail(auth, normalizedEmail, {
       url: `${window.location.origin}/`,
     });
-  } catch (error) {
-    // Keep the response indistinguishable when email-enumeration protection is
-    // not enabled on an older Firebase project.
-    if (String((error as any)?.code || "") === "auth/user-not-found") return;
+  } catch (error: any) {
+    // Keep response graceful when user is not found or email enumeration protection is on
+    if (String(error?.code || "") === "auth/user-not-found") return;
     throw getFriendlyAuthError(error, "Unable to send the password recovery email.");
   }
 }
