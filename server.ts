@@ -12,6 +12,7 @@ import { FieldValue, getFirestore as getAdminFirestore } from "firebase-admin/fi
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import proxy from "express-http-proxy";
+import { sanitizeClinicalOutput, toFormalClientTitleAndLastName } from "./src/lib/clinicalSanitizer";
 
 dotenv.config();
 
@@ -299,9 +300,21 @@ Rules:
 // 1b. Structured Therapist Notes Extractor from Handwritten Notes (7 Fields)
 app.post("/api/extract-therapist-notes", authenticateUser, expensiveApiLimiter, async (req, res) => {
   try {
-    const { fileData, mimeType, filename, rawText, therapistName } = req.body;
+    const { fileData, mimeType, filename, rawText, therapistName, densityLevel } = req.body;
     if (!fileData && !rawText) {
       return res.status(400).json({ error: "Missing file data or text for note extraction" });
+    }
+
+    let densityInstruction = "DENSITY & CONCISENESS MANDATE: Keep all output fields CONCISE, crisp, direct, and succinct. Avoid wordy, repetitive, or long-winded sentences.";
+    const levelNum = Number(densityLevel);
+    if (levelNum === 1 || densityLevel === "ultra-brief") {
+      densityInstruction = "DENSITY MANDATE (LEVEL 1 - ULTRA-BRIEF & HIGH-DENSITY): Generate ULTRA-CONCISE, HIGH-DENSITY, bullet-like facts. Limit each output field strictly to 1-2 short, crisp sentences with maximum information density and zero filler words. STRICTLY ENFORCE ALL ANTI-HALLUCINATION RULES.";
+    } else if (levelNum === 2 || densityLevel === "concise") {
+      densityInstruction = "DENSITY MANDATE (LEVEL 2 - CONCISE & FOCUSED): Provide tight, succinct clinical statements focusing strictly on primary observations, CBT interventions, and next steps without fluff. STRICTLY ENFORCE ALL ANTI-HALLUCINATION RULES.";
+    } else if (levelNum === 3 || densityLevel === "balanced") {
+      densityInstruction = "DENSITY MANDATE (LEVEL 3 - BALANCED CLINICAL DETAIL): Provide clear, well-structured clinical narrative statements with essential context while maintaining a succinct structure. STRICTLY ENFORCE ALL ANTI-HALLUCINATION RULES.";
+    } else if (levelNum === 4 || densityLevel === "comprehensive") {
+      densityInstruction = "DENSITY MANDATE (LEVEL 4 - COMPREHENSIVE DETAIL): Provide thorough clinical documentation with complete details while maintaining strict factual accuracy and zero unstated speculation. STRICTLY ENFORCE ALL ANTI-HALLUCINATION RULES.";
     }
 
     const ai = getGeminiClient();
@@ -341,10 +354,20 @@ Your job is to interpret therapist handwritten session notes, scanned documents,
 1. Date: Session date (e.g., "June 30, 2026").
 2. Title: Session title or type (e.g., "Individual Teletherapy Session" or "Clinical Intake Session").
 3. Session Length: Duration of session (e.g., "30 min", "50 min", "60 min").
-4. Header Note: Arrival observations, timeliness, client engagement, or initial status note (e.g., "Client arrived 10 minutes early and was engaged in the session.").
+4. Header Note: Arrival observations, timeliness, client engagement, or initial status note (e.g., "Mr. Smith arrived 10 minutes early and was engaged in the session.").
 5. Topic/Narrative: The Subjective (S) and Objective (O) parts of the SOAP notes. Include client statements, reported events, life updates, attendance issues, family/financial items, emotional updates, self-care, and observable presentation.
 6. Interventions: The Assessment (A) and Plan (P) / Therapist actions parts of the SOAP notes. Include clinical modalities used (e.g., Cognitive Behavioral therapy), processed feelings, boundary setting guidance, client responses, program/schedule adjustments, and homework or future steps.
 7. Therapist: Therapist name and professional credentials (e.g., "Michele T. Walty, LPC"). Default to "${therapistName || "Michele T. Walty, LPC"}" if not explicitly mentioned in the notes.
+
+CRITICAL CLINICAL BOUNDARIES & ANTI-HALLUCINATION MANDATES (APPLIES TO ALL DENSITY LEVELS):
+1. STRICT FACTUAL ACCURACY: Limit all extracted outputs strictly and exclusively to information explicitly stated in the input notes. You are prohibited from inferring unstated symptoms, medical histories, diagnoses, or treatment plans. Do not assume, extrapolate, infer, or synthesize any clinical facts, diagnoses, symptoms, baseline behaviors, or patient outcomes that are not explicitly documented in the raw input.
+2. NO SPECULATION: If information for a specific section is missing or incomplete, output "Not reported" or leave the section blank. Never assume a default or "normal" status unless explicitly documented in the raw input.
+3. QUOTATIONS: When quoting verbatim or direct statements made by the client, ALWAYS use double quotation marks ("...") and preserve verbatim wording. NEVER use single quotation marks ('...').
+4. UNCERTAINTY HANDLING: If the source text contains contradictory or ambiguous details, explicitly note the discrepancy instead of guessing or assuming details.
+5. VISIBLE HEADINGS: Do NOT include explicit field label prefixes like "Date:", "Title:", "Session Length:", "Header Note:", or "Therapist:" inside the values of those extracted fields. Return raw field values only.
+6. ${densityInstruction}
+7. FORMAL CLIENT NAME MANDATE: ALWAYS refer to the client by their formal title and last name (e.g., "Mr. Smith", "Ms. Davis", "Mr. Morgan", "Ms. Morgan"). NEVER refer to them as "the client", "the patient", "client", or "patient".
+8. NO BRACKETS OR BRACES: NEVER include any curly brackets ({ or }), square brackets ([ or ]), or bracketed placeholders anywhere in the output fields.
 
 SOAP NOTE MAPPING MANDATE:
 - "Topic/Narrative" MUST strictly contain the Subjective (S) & Objective (O) notes.
@@ -381,11 +404,20 @@ Return your response strictly as a JSON object with this EXACT structure:
         date: "June 30, 2026",
         title: "Individual Teletherapy Session",
         sessionLength: "30 min",
-        headerNote: "Client arrived early and was engaged in the session.",
+        headerNote: "Mr. Smith arrived early and was engaged in the session.",
         topicNarrative: response.text || "",
         interventions: "",
         therapist: therapistName || "Michele T. Walty, LPC"
       };
+    }
+
+    // Apply strict clinical sanitization to all text fields
+    if (jsonResult) {
+      const pName = rawText || "";
+      if (jsonResult.headerNote) jsonResult.headerNote = sanitizeClinicalOutput(jsonResult.headerNote, pName);
+      if (jsonResult.topicNarrative) jsonResult.topicNarrative = sanitizeClinicalOutput(jsonResult.topicNarrative, pName);
+      if (jsonResult.interventions) jsonResult.interventions = sanitizeClinicalOutput(jsonResult.interventions, pName);
+      if (jsonResult.title) jsonResult.title = sanitizeClinicalOutput(jsonResult.title, pName);
     }
 
     res.json({ extractedNote: jsonResult });
@@ -418,10 +450,11 @@ app.post("/api/summarize", authenticateUser, expensiveApiLimiter, async (req, re
 
     const ai = getGeminiClient();
 
-    // Humanized patient reference instruction
-    const humanizedDirective = patientName && patientName.trim()
-      ? `7. HUMANIZED CLIENT REFERENCE (CRITICAL): To establish a humanized clinical connection, refer to the client/patient directly as "${patientName.trim()}" throughout the generated progress note and insights sections (e.g. use "S: ${patientName.trim()} stated...", "O: ${patientName.trim()} presented with...", etc.). Do NOT refer to them using cold or generic placeholders like "the client", "the patient", "Client", or "Patient". Refer to them by name or appropriate third-person pronouns (e.g. he/she/they) as grammatically suited.`
-      : `7. Maintain professional documentation standards: Refer to the client/patient respectfully using third-person phrasing (e.g. "the client", "the patient").`;
+    // Humanized patient reference instruction with formal title and last name
+    const formalClientName = toFormalClientTitleAndLastName(patientName || "");
+    const humanizedDirective = formalClientName
+      ? `7. FORMAL CLIENT REFERENCE (CRITICAL MANDATE): You MUST refer to the client exclusively by their formal title and last name "${formalClientName}" throughout all sections (e.g., "${formalClientName} reported...", "${formalClientName} expressed...", "${formalClientName} engaged in CBT techniques..."). NEVER refer to them using cold or generic terms like "the client", "the patient", "Client", or "Patient".`
+      : `7. FORMAL CLIENT REFERENCE (CRITICAL MANDATE): Identify the client's name from the notes and refer to them using their formal title and last name (e.g. "Mr. Smith" or "Ms. Davis" or "Mr. Morgan"). NEVER refer to them as "the client", "the patient", "Client", or "Patient".`;
 
     // Construct framework descriptions and system prompt
     let frameworkPrompt = "";
@@ -473,12 +506,18 @@ P (Plan): Continuation of treatment, modifications, or future intervention plan.
     const systemInstruction = `You are a licensed professional clinical therapist and expert clinical documenter. 
 Your task is to synthesize the provided session notes, files, or transcript into a top-tier, compliant, professional psychotherapy progress note.
 
-Strict Clinical Guidelines:
-1. Maintain professional, formal, objective language. Avoid emotional descriptions of your own; instead, describe therapist interventions objectively.
-2. Maintain high-level privacy: focus purely on clinical progress.
-3. Tone of the output: ${tone} (e.g., clinical, academic, collaborative).
-4. Desired length: ${length} (strictly adhere to generating approximately ${quantity} paragraphs or equivalent sub-sections per category).
-5. ABSOLUTE CONSTRAINT: Do NOT use ANY markdown formatting in your response. Do not use double asterisks (**), single asterisks (*), markdown headers (#, ##, etc.), markdown lists, bolding, italics, or any other markdown syntax. All headers or section titles must be plain text capital letters followed by a colon or a simple line break (for example, use "S (Subjective):" or "O (Objective):" instead of "**S (Subjective)**:" or "**O (Objective)**:"). Ensure the entire text is clean, pure text ready for direct copying and pasting into standard text areas without any syntax clutter.
+Strict Clinical Guidelines & Anti-Hallucination Mandates:
+1. STRICT FACTUAL ACCURACY: Limit all outputs strictly and exclusively to information explicitly stated in the input notes. You are prohibited from inferring unstated symptoms, medical histories, diagnoses, or treatment plans. Do not assume, extrapolate, infer, or synthesize any clinical facts, diagnoses, symptoms, baseline behaviors, or patient outcomes that are not explicitly documented in the raw input.
+2. NO SPECULATION: If information for a specific section is missing or incomplete, output "Not reported" or leave the section blank. Never assume a default or "normal" status unless explicitly documented in the raw input.
+3. QUOTATIONS: When quoting verbatim or direct statements made by the client, ALWAYS use double quotation marks ("...") and preserve verbatim wording. NEVER use single quotation marks ('...').
+4. UNCERTAINTY HANDLING: If the source text contains contradictory or ambiguous details, explicitly note the discrepancy instead of guessing or assuming details.
+5. CONCISENESS MANDATE (CRITICAL): Keep all generated sections concise, crisp, direct, and high-density. Eliminate unnecessary fluff, repetitive phrases, or long-winded preamble. Avoid generating overly long paragraphs.
+6. FORMAL CLIENT NAME MANDATE: ALWAYS refer to the client using their formal title and last name (e.g. "Mr. Smith", "Ms. Davis", "Mr. Morgan", "Ms. Morgan"). NEVER refer to them as "the client", "the patient", "client", or "patient".
+7. ABSOLUTE NO-BRACKET CONSTRAINT: Do NOT include ANY curly brackets ({ or }), square brackets ([ or ]), or bracketed placeholders anywhere in the output text.
+8. Maintain professional, formal, objective language.
+9. Tone of the output: ${tone} (e.g., clinical, academic, collaborative).
+10. Desired length: ${length} (strictly keep output concise, focused, and succinct; do not pad sentences).
+11. ABSOLUTE CONSTRAINT: Do NOT use ANY markdown formatting in your response. Do not use double asterisks (**), single asterisks (*), markdown headers (#, ##, etc.), markdown lists, bolding, italics, or any other markdown syntax. All headers or section titles must be plain text capital letters followed by a colon or a simple line break (for example, use "S (Subjective):" or "O (Objective):" instead of "**S (Subjective)**:" or "**O (Objective)**:"). Ensure the entire text is clean, pure text ready for direct copying and pasting into standard text areas without any syntax clutter.
 
 ${humanizedDirective}
 
@@ -541,8 +580,11 @@ Generate the highly secure, pristine session summary note below following your c
       }
     }
 
+    const rawSummary = response.text || "";
+    const sanitizedSummary = sanitizeClinicalOutput(rawSummary, patientName);
+
     res.json({ 
-      summary: response.text || "",
+      summary: sanitizedSummary,
       fallbackUsed
     });
   } catch (error: any) {

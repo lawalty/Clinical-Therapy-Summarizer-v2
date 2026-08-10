@@ -45,6 +45,7 @@ import { CLINICAL_TEMPLATES } from "./components/InstructionTemplates";
 import LockScreen from "./components/LockScreen";
 import AppModeSelectorModal, { AppToolMode } from "./components/AppModeSelectorModal";
 import TherapistNotesExtractor from "./components/TherapistNotesExtractor";
+import { sanitizeClinicalOutput, toFormalClientTitleAndLastName } from "./lib/clinicalSanitizer";
 import { motion, AnimatePresence } from "motion/react";
 
 // Robust client-side helper to extract the patient's name from clinical session notes
@@ -438,11 +439,20 @@ export default function App() {
     await loadArchives();
   };
 
-  const handleTransferNoteToSummaryGenerator = (formattedNote: string, detectedPatientName?: string) => {
+  const handleTransferNoteToSummaryGenerator = (formattedNote: string, detectedPatientName?: string, densityLevel?: number) => {
     setVerbatimText(formattedNote);
     if (detectedPatientName) {
       setBasePatientName(detectedPatientName);
       setPatientNameInput(getFormattedPatientName(detectedPatientName, patientNameFormat));
+    }
+    if (densityLevel) {
+      if (densityLevel === 1 || densityLevel === 2) {
+        setLength("concise");
+      } else if (densityLevel === 3) {
+        setLength("medium");
+      } else if (densityLevel === 4) {
+        setLength("detailed");
+      }
     }
     setActiveToolMode("summary-generator");
     setSuccess("Transferred extracted handwritten notes to Clinical Summary Generator!");
@@ -591,9 +601,11 @@ export default function App() {
         throw new Error(result.error || "Model generation failed");
       }
 
-      setGeneratedSummary(result.summary || "");
-      const formattedName = patientNameInput;
-      const pName = formattedName || extractPatientName(verbatimText) || extractPatientName(result.summary || "");
+      const rawPName = patientNameInput || extractPatientName(verbatimText) || "";
+      const cleanedSummary = sanitizeClinicalOutput(result.summary || "", rawPName);
+      setGeneratedSummary(cleanedSummary);
+      const formattedName = toFormalClientTitleAndLastName(patientNameInput) || patientNameInput;
+      const pName = formattedName || toFormalClientTitleAndLastName(extractPatientName(verbatimText)) || extractPatientName(result.summary || "");
       const todayStr = new Date().toLocaleDateString(undefined, {
         month: "short",
         day: "numeric",

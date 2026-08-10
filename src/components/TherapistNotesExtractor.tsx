@@ -28,9 +28,13 @@ import {
   Camera,
   Video,
   RefreshCw,
-  Maximize2
+  Maximize2,
+  Sliders,
+  Gauge,
+  AlignLeft
 } from "lucide-react";
 import { TherapistUser, getAuthHeaders } from "../lib/firebase";
+import { sanitizeClinicalOutput } from "../lib/clinicalSanitizer";
 import { motion, AnimatePresence } from "motion/react";
 
 export interface ExtractedTherapistNote {
@@ -46,9 +50,40 @@ export interface ExtractedTherapistNote {
 interface TherapistNotesExtractorProps {
   user: TherapistUser | null;
   therapistName: string;
-  onSendToSummaryGenerator: (formattedNote: string, patientName?: string) => void;
+  onSendToSummaryGenerator: (formattedNote: string, patientName?: string, densityLevel?: number) => void;
   onSaveArchive: (name: string, content: string, framework: string) => Promise<void>;
 }
+
+export const DENSITY_PRESETS = [
+  {
+    level: 1,
+    badge: "⚡ Ultra-Brief & High-Density",
+    title: "Level 1: Ultra-Brief & High-Density",
+    description: "Maximum conciseness and information density. Generates 1-2 ultra-crisp bullet points per section with zero filler words.",
+    shortName: "Ultra-Brief"
+  },
+  {
+    level: 2,
+    badge: "🎯 Concise & Focused",
+    title: "Level 2: Concise & Focused (Default)",
+    description: "Tight, succinct clinical statements focusing strictly on primary observations, CBT interventions, and next steps.",
+    shortName: "Concise"
+  },
+  {
+    level: 3,
+    badge: "⚖️ Balanced Clinical",
+    title: "Level 3: Balanced Clinical Detail",
+    description: "Standard clinical narrative notes with complete essential context and balanced SOAP structure.",
+    shortName: "Balanced"
+  },
+  {
+    level: 4,
+    badge: "📜 Comprehensive Detail",
+    title: "Level 4: Comprehensive Detail",
+    description: "Extended clinical narrative containing comprehensive descriptions, full patient updates, and thorough intervention details.",
+    shortName: "Comprehensive"
+  }
+];
 
 // Sample handwritten note template for demonstration
 const SAMPLE_PATIENT_NOTE: ExtractedTherapistNote = {
@@ -178,49 +213,70 @@ export default function TherapistNotesExtractor({
   const getCombinedFormattedNote = (note: ExtractedTherapistNote): string => {
     const blocks: string[] = [];
 
-    // Top header line: Date Title Session Length
-    const topHeader = [note.date, note.title, note.sessionLength].filter(Boolean).join(" ");
+    // Strip any field prefixes from Date, Title, Session Length
+    const cleanDate = (note.date || "").replace(/^(date|session date):\s*/i, "").trim();
+    const cleanTitle = (note.title || "").replace(/^(title|session title|session type):\s*/i, "").trim();
+    const cleanSessionLength = (note.sessionLength || "").replace(/^(session length|length|duration):\s*/i, "").trim();
+
+    // 1. Top header line: Date Title Session Length
+    const topHeader = [cleanDate, cleanTitle, cleanSessionLength].filter(Boolean).join(" ");
     if (topHeader) {
       blocks.push(topHeader);
     }
 
-    // Header Note
+    // 2. Header Note (Rendered without field heading label)
     if (note.headerNote) {
-      const cleanHeaderNote = note.headerNote.replace(/^(Header Note|Header|Arrival Note):\s*/i, "");
-      blocks.push(cleanHeaderNote);
+      const cleanHeaderNote = note.headerNote.replace(/^(Header Note|Header|Arrival Note|Status Note):\s*/i, "").trim();
+      if (cleanHeaderNote) {
+        blocks.push(cleanHeaderNote);
+      }
     }
 
-    // Topic/Narrative
+    // 3. Topic/Narrative (Rendered ONLY with Topic/Narrative: field heading label)
     if (note.topicNarrative) {
-      const cleanTopic = note.topicNarrative.replace(/^Topic\/Narrative:\s*/i, "");
-      blocks.push(`Topic/Narrative: ${cleanTopic}`);
+      const cleanTopic = note.topicNarrative.replace(/^Topic\/Narrative:\s*/i, "").trim();
+      if (cleanTopic) {
+        blocks.push(`Topic/Narrative: ${cleanTopic}`);
+      }
     }
 
-    // Interventions
+    // 4. Interventions (Rendered ONLY with Interventions: field heading label)
     if (note.interventions) {
-      const cleanInterventions = note.interventions.replace(/^Interventions:\s*/i, "");
-      blocks.push(`Interventions: ${cleanInterventions}`);
+      const cleanInterventions = note.interventions.replace(/^Interventions:\s*/i, "").trim();
+      if (cleanInterventions) {
+        blocks.push(`Interventions: ${cleanInterventions}`);
+      }
     }
 
-    // Therapist
+    // 5. Therapist (Rendered without field heading label)
     if (note.therapist) {
-      const cleanTherapist = note.therapist.replace(/^(Therapist|Provider):\s*/i, "");
-      blocks.push(cleanTherapist);
+      const cleanTherapist = note.therapist.replace(/^(Therapist|Provider|Credentials):\s*/i, "").trim();
+      if (cleanTherapist) {
+        blocks.push(cleanTherapist);
+      }
     }
 
-    return blocks.join("\n\n");
+    return sanitizeClinicalOutput(blocks.join("\n\n"));
   };
 
+  const [densityLevel, setDensityLevel] = useState<number>(2);
+  const [lastPayload, setLastPayload] = useState<{ fileData?: string; mimeType?: string; filename?: string; rawText?: string } | null>(null);
+
   // Perform AI Extraction via /api/extract-therapist-notes
-  const performExtraction = async (payload: { fileData?: string; mimeType?: string; filename?: string; rawText?: string }) => {
+  const performExtraction = async (
+    payload: { fileData?: string; mimeType?: string; filename?: string; rawText?: string },
+    overrideDensity?: number
+  ) => {
     if (!user) {
       setError("Please log in to use the Therapist Notes Extractor.");
       return;
     }
 
+    const currentDensity = overrideDensity ?? densityLevel;
+    setLastPayload(payload);
     setIsProcessing(true);
     setError("");
-    setSuccess("AI Analyzing Handwritten Notes & Mapping SOAP Structure...");
+    setSuccess(`AI Analyzing Handwritten Notes with Level ${currentDensity} Density...`);
 
     try {
       const headers = await getAuthHeaders(user.uid);
@@ -229,7 +285,8 @@ export default function TherapistNotesExtractor({
         headers,
         body: JSON.stringify({
           ...payload,
-          therapistName: therapistName || "Michele T. Walty, LPC"
+          therapistName: therapistName || "Michele T. Walty, LPC",
+          densityLevel: currentDensity
         })
       });
 
@@ -240,19 +297,20 @@ export default function TherapistNotesExtractor({
 
       const data = await response.json();
       if (data.extractedNote) {
+        const rawPN = payload.rawText || payload.filename || "";
         const result: ExtractedTherapistNote = {
-          date: data.extractedNote.date || "",
-          title: data.extractedNote.title || "",
-          sessionLength: data.extractedNote.sessionLength || "",
-          headerNote: data.extractedNote.headerNote || "",
-          topicNarrative: data.extractedNote.topicNarrative || "",
-          interventions: data.extractedNote.interventions || "",
+          date: sanitizeClinicalOutput(data.extractedNote.date || "", rawPN),
+          title: sanitizeClinicalOutput(data.extractedNote.title || "", rawPN),
+          sessionLength: sanitizeClinicalOutput(data.extractedNote.sessionLength || "", rawPN),
+          headerNote: sanitizeClinicalOutput(data.extractedNote.headerNote || "", rawPN),
+          topicNarrative: sanitizeClinicalOutput(data.extractedNote.topicNarrative || "", rawPN),
+          interventions: sanitizeClinicalOutput(data.extractedNote.interventions || "", rawPN),
           therapist: data.extractedNote.therapist || therapistName || "Michele T. Walty, LPC"
         };
 
         setNoteData(result);
         setHasExtractedData(true);
-        setSuccess("Handwritten notes successfully transcribed and structured into 7 clinical fields!");
+        setSuccess(`Notes successfully transcribed into 7 fields with Level ${currentDensity} Density!`);
         setTimeout(() => setSuccess(""), 4000);
       } else {
         throw new Error("No extracted note returned from AI service.");
@@ -749,6 +807,79 @@ export default function TherapistNotesExtractor({
             )}
           </div>
 
+          {/* Concise & High-Density Outputs Slider Sidebar Card */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-5 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2">
+                <Sliders className="w-4 h-4 text-teal-600 shrink-0" />
+                <h3 className="text-sm font-bold text-slate-800 font-display">
+                  Concise & High-Density Outputs
+                </h3>
+              </div>
+              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-teal-50 text-teal-800 border border-teal-200/80">
+                {DENSITY_PRESETS[densityLevel - 1].badge}
+              </span>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex justify-between items-center text-xs">
+                <label className="font-semibold text-slate-700 flex items-center gap-1.5">
+                  <Gauge className="w-3.5 h-3.5 text-teal-600" />
+                  <span>Output Density & Length Slider:</span>
+                </label>
+                <span className="font-bold text-teal-700">Level {densityLevel} of 4</span>
+              </div>
+
+              {/* Slider Bar */}
+              <input
+                type="range"
+                min="1"
+                max="4"
+                step="1"
+                value={densityLevel}
+                onChange={(e) => {
+                  const newLevel = Number(e.target.value);
+                  setDensityLevel(newLevel);
+                }}
+                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-teal-600 focus:outline-none focus:ring-2 focus:ring-teal-500/50"
+              />
+
+              <div className="grid grid-cols-4 text-[10px] text-slate-500 font-medium text-center">
+                <span className={densityLevel === 1 ? "font-bold text-teal-700" : ""}>1. Ultra-Brief</span>
+                <span className={densityLevel === 2 ? "font-bold text-teal-700" : ""}>2. Concise</span>
+                <span className={densityLevel === 3 ? "font-bold text-teal-700" : ""}>3. Balanced</span>
+                <span className={densityLevel === 4 ? "font-bold text-teal-700" : ""}>4. Detailed</span>
+              </div>
+
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200/80 text-xs space-y-1">
+                <p className="font-bold text-slate-800">
+                  {DENSITY_PRESETS[densityLevel - 1].title}
+                </p>
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                  {DENSITY_PRESETS[densityLevel - 1].description}
+                </p>
+              </div>
+
+              {/* Re-extract button if notes or file payload exist */}
+              {(lastPayload || hasExtractedData || rawTextInput.trim()) && (
+                <button
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => {
+                    const activePayload = lastPayload || {
+                      rawText: rawTextInput.trim() || getCombinedFormattedNote(noteData)
+                    };
+                    performExtraction(activePayload, densityLevel);
+                  }}
+                  className="w-full py-2 bg-teal-700 hover:bg-teal-800 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-2xs transition-all flex items-center justify-center gap-2 cursor-pointer mt-1"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>Re-Extract Notes with Level {densityLevel} Density</span>
+                </button>
+              )}
+            </div>
+          </div>
+
           {/* Quick Explanation & SOAP Mapping Rules Box */}
           <div className="bg-teal-50/60 border border-teal-200/80 rounded-2xl p-5 text-xs text-slate-700 space-y-3">
             <div className="flex items-center gap-2 font-bold text-teal-900 text-xs">
@@ -991,7 +1122,7 @@ export default function TherapistNotesExtractor({
                   {/* Send to Clinical Summary Notes Generator */}
                   <button
                     type="button"
-                    onClick={() => onSendToSummaryGenerator(combinedNoteText, noteData.headerNote.includes("Alex") ? "Alex Morgan" : undefined)}
+                    onClick={() => onSendToSummaryGenerator(combinedNoteText, noteData.headerNote.includes("Alex") ? "Alex Morgan" : undefined, densityLevel)}
                     className="px-4 py-2.5 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-xl shadow-md transition-all flex items-center gap-2 cursor-pointer ml-auto"
                   >
                     <span>Send to Clinical Summary Generator</span>

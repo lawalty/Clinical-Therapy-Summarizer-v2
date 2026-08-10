@@ -16,7 +16,7 @@ export const CLINICAL_TEMPLATES: ClinicalTemplate[] = [
     instructions: `Write with objective, third-person terminology. Use clinical action verbs (e.g., "reported," "expressed," "described," "evidenced").
 Do not use informal phrasing. Quantify observations where possible (e.g., "gaze maintained 80% of session").
 Distinguish clearly between patient's self-report and therapist's clinical assessment.
-Ensure safety is explicitly stated. Refer to the patient as "the client" or "the client (initials)" to protect privacy.`
+Ensure safety is explicitly stated. Refer to the client using their formal title and last name (e.g., "Mr. Smith" or "Ms. Davis").`
   },
   {
     name: "CBT (Cognitive Behavioral)",
