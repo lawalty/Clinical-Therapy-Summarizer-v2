@@ -736,7 +736,7 @@ export default function TherapistNotesExtractor({
 
                   <div className="mt-4 px-3 py-1.5 bg-teal-50 text-teal-700 rounded-lg text-xs font-semibold border border-teal-200/80 inline-flex items-center gap-1.5">
                     <Zap className="w-3.5 h-3.5" />
-                    <span>Gemini 3.5 Multimodal OCR Active</span>
+                    <span>Gemini 4 Neon Multimodal OCR Active</span>
                   </div>
                 </div>
 

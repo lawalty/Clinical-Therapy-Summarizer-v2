@@ -195,11 +195,11 @@ const formatGeminiError = (error: any, defaultMessage: string): string => {
   const errMsg = error.message || defaultMessage;
   const errStr = errMsg.toLowerCase();
   
-  if (status === 403 || errStr.includes("api_key_invalid") || errStr.includes("api key is invalid") || errStr.includes("suspended")) {
-    return "Your Gemini API Key has been suspended or is invalid. Please check your billing details, payment status, or key configuration in the AI Studio Settings menu.";
+  if (status === 403 || errStr.includes("permission_denied") || errStr.includes("api_key_invalid") || errStr.includes("api key is invalid") || errStr.includes("suspended")) {
+    return "Your Gemini API Key is invalid or lacks permission. Please check or select a valid key in the Settings > Secrets panel.";
   }
   if (status === 429 || errStr.includes("resource_exhausted") || errStr.includes("quota exceeded") || errStr.includes("rate limit")) {
-    return "The rate limit or daily quota for your Gemini API key has been exceeded. Please check your usage metrics or upgrade your plan in the Google AI Studio console.";
+    return "The rate limit or daily quota for your Gemini API key has been exceeded. Please select a billing-enabled API key in the Settings > Secrets panel or check your quota.";
   }
   return errMsg;
 };
@@ -284,10 +284,32 @@ Rules:
 4. Output ONLY the extracted text. Do not write any conversational preamble or introduction.`,
     };
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: [filePart, textPart],
-    });
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-4-neon",
+        contents: [filePart, textPart],
+      });
+    } catch (err: any) {
+      const status = err.status || err.code || err.statusCode;
+      const errStr = (err.message || "").toLowerCase();
+      const isQuotaOrBillingError =
+        status === 429 ||
+        errStr.includes("resource_exhausted") ||
+        errStr.includes("quota exceeded") ||
+        errStr.includes("rate limit") ||
+        errStr.includes("billing not enabled");
+
+      if (isQuotaOrBillingError) {
+        console.warn("Gemini 4 Neon quota exceeded or billing not enabled. Falling back to gemini-4-hydrogen...");
+        response = await ai.models.generateContent({
+          model: "gemini-4-hydrogen",
+          contents: [filePart, textPart],
+        });
+      } else {
+        throw err;
+      }
+    }
 
     res.json({ text: response.text || "" });
   } catch (error: any) {
@@ -386,13 +408,38 @@ Return your response strictly as a JSON object with this EXACT structure:
 
     contents.push({ text: promptText });
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: contents,
-      config: {
-        responseMimeType: "application/json"
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: "gemini-4-neon",
+        contents: contents,
+        config: {
+          responseMimeType: "application/json",
+        },
+      });
+    } catch (err: any) {
+      const status = err.status || err.code || err.statusCode;
+      const errStr = (err.message || "").toLowerCase();
+      const isQuotaOrBillingError =
+        status === 429 ||
+        errStr.includes("resource_exhausted") ||
+        errStr.includes("quota exceeded") ||
+        errStr.includes("rate limit") ||
+        errStr.includes("billing not enabled");
+
+      if (isQuotaOrBillingError) {
+        console.warn("Gemini 4 Neon quota exceeded or billing not enabled. Falling back to gemini-4-hydrogen...");
+        response = await ai.models.generateContent({
+          model: "gemini-4-hydrogen",
+          contents: contents,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+      } else {
+        throw err;
       }
-    });
+    }
 
     let jsonResult;
     try {
@@ -546,7 +593,7 @@ Generate the highly secure, pristine session summary note below following your c
     let fallbackUsed = false;
     try {
       response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
+        model: "gemini-4-neon",
         contents: userPrompt,
         config: {
           systemInstruction,
@@ -566,9 +613,9 @@ Generate the highly secure, pristine session summary note below following your c
         errStr.includes("billing not enabled");
         
       if (isQuotaOrAuthError) {
-        console.warn("Pro model quota exceeded or billing not enabled. Falling back to gemini-3.5-flash...");
+        console.warn("Gemini 4 Neon quota exceeded or billing not enabled. Falling back to gemini-4-hydrogen...");
         response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
+          model: "gemini-4-hydrogen",
           contents: userPrompt,
           config: {
             systemInstruction,

@@ -486,7 +486,7 @@ export default function App() {
     setSettingsSavedStatus("idle");
   };
 
-  // Extract text from dropped or uploaded files via Gemini 3.5 Flash
+  // Extract text from dropped or uploaded files via Gemini 4 Neon
   const processFileUpload = async (file: File) => {
     if (!file) return;
     if (!user) return;
@@ -561,7 +561,7 @@ export default function App() {
     }
   };
 
-  // Generate Summary using gemini-3.1-pro-preview with HIGH thinking level
+  // Generate Summary using gemini-4-neon with HIGH thinking level
   const handleGenerateSummary = async () => {
     if (!verbatimText.trim()) {
       setError("Please input clinical notes or upload a repository document before generating.");
@@ -616,9 +616,9 @@ export default function App() {
         : `Patient Note - ${framework} - ${todayStr}`;
       setArchiveNameInput(defaultName);
       if (result.fallbackUsed) {
-        setSuccess("Session summary generated successfully (using optimized standard quota model).");
+        setSuccess("Session summary generated successfully (using Gemini 4 Hydrogen fallback).");
       } else {
-        setSuccess("Session summary generated with high intelligence thinking.");
+        setSuccess("Session summary generated with Gemini 4 Neon.");
       }
     } catch (err: any) {
       console.error(err);
@@ -1504,7 +1504,7 @@ export default function App() {
                 <span>Clinical Synthesis Engine</span>
               </h3>
               <p className="text-xs text-slate-500 mt-0.5">
-                Formulates clean, secure progress summaries via Gemini high-reasoning thinking.
+                Formulates clean, secure progress summaries via Gemini 4 Neon high-reasoning thinking.
               </p>
             </div>
 
@@ -1540,7 +1540,7 @@ export default function App() {
                   <div className="absolute inset-0 border-3 border-indigo-600 border-t-transparent rounded-full animate-spin" />
                   <Sparkles className="absolute inset-0 m-auto w-4 h-4 text-indigo-600 animate-pulse" />
                 </div>
-                <h4 className="text-xs font-bold text-slate-900 font-display">Activating Gemini Clinical Thinking Engine</h4>
+                <h4 className="text-xs font-bold text-slate-900 font-display">Activating Gemini 4 Neon Clinical Engine</h4>
                 <p className="text-[10px] text-slate-500 max-w-xs mt-1 leading-relaxed">
                   Structuring material according to the {framework} protocol, checking clinical guidelines, and applying format constraints.
                 </p>
